@@ -63,6 +63,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
+    parser = _add_cdc_args(parser)  # CHANGE: add cdc args
 
     return parser
 
@@ -1043,7 +1044,9 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['is_hybrid_model'] = args.is_hybrid_model
 
     # Return config.
-    return config_class(**kw_args)
+    config = config_class(**kw_args)
+    config.args = args
+    return config
 
 
 def _add_transformer_engine_args(parser):
@@ -2680,4 +2683,38 @@ def _add_experimental_args(parser):
                        help='Dtype of exp_avg when enabling precision-aware-optimizer')
     group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
                        help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+    return parser
+
+def _add_cdc_args(parser):
+    # CHANGE: add cdc args
+    group = parser.add_argument_group(title='cross data-center training (DiLoCo)')
+
+    group.add_argument('--use-cdc', action='store_true',
+                       help='Use cdc distributed training.')
+    group.add_argument('--cdc-algorithm', type=str, default='diloco',
+                       choices=['diloco', 'streaming', 'dc'],
+                       help='cdc algorithm to use.')
+    group.add_argument('--cdc-num-shards', type=int, default=1,
+                       help='Number of shards for Streaming/DC DiLoCo.')
+    group.add_argument('--cdc-sync-interval', type=int, default=100,
+                       help='Number of inner steps between outer synchronization.')
+    group.add_argument('--cdc-outer-lr', type=float, default=0.7,
+                       help='Learning rate for the outer optimizer.')
+    group.add_argument('--cdc-parallel-size', type=int, default=1,
+                       help='Number of DiLoCo islands (outer data parallel size).')
+    group.add_argument('--cdc-offload-outer-opt', action='store_true',
+                       help='Offload outer optimizer to CPU.')
+    
+    # DC-DiLoCo specific
+    group.add_argument('--cdc-dc-N', type=int, default=4,
+                       help='Expected maximum number of transmissions within one sync_interval for DC-DiLoCo.')
+    group.add_argument('--cdc-dc-lambda', type=float, default=2.0,
+                       help='Lambda coefficient for DC-DiLoCo delay compensation.')
+    group.add_argument('--cdc-delay', type=int, default=0,
+                       help='Simulated communication delay (in steps) for Streaming-based methods.')
+    group.add_argument('--cdc-streaming-alpha', type=float, default=0.5,
+                       help='Alpha for Streaming DiLoCo blending (local = alpha * local + (1-alpha) * global).')
+    group.add_argument('--cdc-verbose', action='store_true',
+                       help='Enable verbose logging for CDC optimizer.')
+
     return parser

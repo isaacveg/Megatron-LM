@@ -357,6 +357,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.enable_gloo_process_groups,
+                cdc_parallel_size=args.cdc_parallel_size,   # CHANGE: add more parallel groups
             )
             if args.rank == 0:
                 print(

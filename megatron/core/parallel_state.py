@@ -115,6 +115,12 @@ _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
 # combined parallel group of TP, DP, and CP used for fp8
 _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 
+# CHANGE: add Cross-DC parallel group (outer data-parallel across islands)
+_CDC_PARALLEL_GROUP = None
+_CDC_PARALLEL_GLOBAL_RANKS = None
+_MPU_CDC_PARALLEL_WORLD_SIZE = None
+_MPU_CDC_PARALLEL_RANK = None
+
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
@@ -448,6 +454,7 @@ def initialize_model_parallel(
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
+    cdc_parallel_size: int = 1,
 ) -> None:
     # pylint: disable=line-too-long
     """Initialize model data parallel groups.
@@ -570,6 +577,9 @@ def initialize_model_parallel(
             Create Gloo process groups if set to True. If set to False, Gloo process groups are
             not created and calls to get Gloo process groups will result in assertion errors.
 
+        cdc_parallel_size (int, default = 1):
+            The number of data center islands (outer data parallel size).
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -630,7 +640,16 @@ def initialize_model_parallel(
         raise RuntimeError(f"world_size ({world_size}) is not divisible by {total_model_size}")
 
     data_parallel_size: int = world_size // total_model_size
+    
+    # CHANGE: DiLoCo-like: Split data_parallel_size into inner (Megatron) and outer (DiLoCo)
+    if data_parallel_size % cdc_parallel_size != 0:
+        raise RuntimeError(
+            f"data_parallel_size ({data_parallel_size}) is not divisible by cdc_parallel_size ({cdc_parallel_size})"
+        )
+    inner_data_parallel_size = data_parallel_size // cdc_parallel_size
 
+    
+    
     encoder_world_size = encoder_model_size * data_parallel_size
     decoder_world_size = decoder_model_size * data_parallel_size
 
@@ -790,25 +809,73 @@ def initialize_model_parallel(
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    global _CDC_PARALLEL_GROUP  # CHANGE: CDC
+    global _CDC_PARALLEL_GLOBAL_RANKS
+    global _MPU_CDC_PARALLEL_WORLD_SIZE
+    global _MPU_CDC_PARALLEL_RANK
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
-    for ranks in generator_wrapper('dp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp', nccl_comm_cfgs),
-            group_desc='DATA_PARALLEL_GROUP',
-        )
-        if create_gloo_process_groups:
-            group_gloo = create_group(
-                ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
+    # for ranks in generator_wrapper('dp'):
+    #     group = create_group(
+    #         ranks,
+    #         timeout=timeout,
+    #         pg_options=get_nccl_options('dp', nccl_comm_cfgs),
+    #         group_desc='DATA_PARALLEL_GROUP',
+    #     )
+    #     if create_gloo_process_groups:
+    #         group_gloo = create_group(
+    #             ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
+    #         )
+    #     else:
+    #         group_gloo = None
+    #     if rank in ranks:
+    #         _DATA_PARALLEL_GROUP = group
+    #         _DATA_PARALLEL_GROUP_GLOO = group_gloo
+    #         _DATA_PARALLEL_GLOBAL_RANKS = ranks
+    # CHANGE: DiLoCo / CDC: Split global DP ranks into Inner DP (Megatron) and Outer DP (Cross-DC)
+    all_dp_ranks_lists = list(generator_wrapper('dp'))
+    
+    for global_dp_ranks in all_dp_ranks_lists:
+        assert len(global_dp_ranks) == data_parallel_size
+        
+        # 1. Create Inner DP Groups (Megatron DP)
+        for i in range(cdc_parallel_size):
+            start_idx = i * inner_data_parallel_size
+            end_idx = (i + 1) * inner_data_parallel_size
+            inner_dp_ranks = global_dp_ranks[start_idx:end_idx]
+            
+            group = create_group(
+                inner_dp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('dp', nccl_comm_cfgs),
+                group_desc='DATA_PARALLEL_GROUP',
             )
-        else:
-            group_gloo = None
-        if rank in ranks:
-            _DATA_PARALLEL_GROUP = group
-            _DATA_PARALLEL_GROUP_GLOO = group_gloo
-            _DATA_PARALLEL_GLOBAL_RANKS = ranks
+            if create_gloo_process_groups:
+                group_gloo = create_group(
+                    inner_dp_ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
+                )
+            else:
+                group_gloo = None
+            if rank in inner_dp_ranks:
+                _DATA_PARALLEL_GROUP = group
+                _DATA_PARALLEL_GROUP_GLOO = group_gloo
+                _DATA_PARALLEL_GLOBAL_RANKS = inner_dp_ranks
+
+        # 2. Create Outer DP Groups (CDC cross-DC group)
+        for j in range(inner_data_parallel_size):
+            outer_dp_ranks = [global_dp_ranks[i * inner_data_parallel_size + j] for i in range(cdc_parallel_size)]
+            
+            group = create_group(
+                outer_dp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('dp', nccl_comm_cfgs),
+                group_desc='CDC_PARALLEL_GROUP',
+            )
+            if rank in outer_dp_ranks:
+                _CDC_PARALLEL_GROUP = group
+                _CDC_PARALLEL_GLOBAL_RANKS = outer_dp_ranks
+                _MPU_CDC_PARALLEL_WORLD_SIZE = len(outer_dp_ranks)
+                _MPU_CDC_PARALLEL_RANK = outer_dp_ranks.index(rank)
 
     assert (
         data_parallel_size * context_parallel_size
@@ -1253,6 +1320,43 @@ def get_tensor_model_parallel_group(check_initialized=True):
             _TENSOR_MODEL_PARALLEL_GROUP is not None
         ), 'tensor model parallel group is not initialized'
     return _TENSOR_MODEL_PARALLEL_GROUP
+
+# CHANGE: CDC helpers
+def get_cdc_parallel_group():
+    """Get the cross-DC (CDC) parallel group the caller rank belongs to.
+
+    This group spans the outer data-parallel dimension across DC islands.
+    """
+    assert _CDC_PARALLEL_GROUP is not None, 'Cross-DC parallel group is not initialized'
+    return _CDC_PARALLEL_GROUP
+
+
+def get_cdc_parallel_world_size():
+    """Return world size for the CDC (outer DP) group."""
+    global _MPU_CDC_PARALLEL_WORLD_SIZE
+    if _MPU_CDC_PARALLEL_WORLD_SIZE is not None:
+        return _MPU_CDC_PARALLEL_WORLD_SIZE
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and _CDC_PARALLEL_GROUP is not None
+    ):
+        return torch.distributed.get_world_size(group=_CDC_PARALLEL_GROUP)
+    return 0
+
+
+def get_cdc_parallel_rank():
+    """Return caller's rank in the CDC (outer DP) group."""
+    global _MPU_CDC_PARALLEL_RANK
+    if _MPU_CDC_PARALLEL_RANK is not None:
+        return _MPU_CDC_PARALLEL_RANK
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and _CDC_PARALLEL_GROUP is not None
+    ):
+        return torch.distributed.get_rank(group=_CDC_PARALLEL_GROUP)
+    return 0
 
 
 def get_pipeline_model_parallel_group():

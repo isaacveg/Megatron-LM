@@ -1122,6 +1122,8 @@ def setup_model_and_optimizer(model_provider_func,
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = timers
+    # CHANGE: pass args to config for use in optimizers
+    config.args = args
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult,
                                        use_gloo_process_groups=args.enable_gloo_process_groups)

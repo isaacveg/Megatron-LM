@@ -98,7 +98,9 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if base > 10000.0:
         max_position_embeddings = 32768 if "mistral" in model_size else 16384
     else:
-        max_position_embeddings = 4096
+        # max_position_embeddings = 4096
+        # CHANGE: the original code above assumes 4096, fix the limitation
+        max_position_embeddings = params["max_position_embeddings"]
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
@@ -283,7 +285,9 @@ def load_args_from_checkpoint(args, model_size):
         model_args = json.load(f)
 
     # Update Megatron args.
-    args.seq_length = 4096
+    # args.seq_length = 4096
+    # CHANGE: allow different seq lengths
+    args.seq_length = model_args["max_position_embeddings"]
     if "llama2" in model_size:
         # Correct bug in earlier conversion script.
         args.max_position_embeddings = 4096
@@ -435,6 +439,7 @@ def _load_checkpoint(queue, args):
                 '--no-masked-softmax-fusion',
                 '--no-bias-gelu-fusion',
                 '--no-bias-dropout-fusion',
+                '--no-gradient-accumulation-fusion',    # CHANGE: disable
                 '--no-async-tensor-model-parallel-allreduce',
                 '--use-cpu-initialization',
                 '--micro-batch-size', '1',
@@ -475,6 +480,10 @@ def _load_checkpoint(queue, args):
 
     margs.use_legacy_models = True
     margs.transformer_impl = args.loader_transformer_impl
+    if margs.transformer_impl != 'transformer_engine':
+        # CHANGE: Rope fusion requires TransformerEngine/Apex kernels; disable it when using the local
+        # implementation so conversion does not depend on optional TE builds.
+        margs.apply_rope_fusion = False
 
     margs.position_embedding_type = "rope"
 

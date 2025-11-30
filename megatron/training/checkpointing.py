@@ -151,6 +151,24 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     if expert_parallel:
         common_path = common_path + f'_{expert_rank:03d}'
 
+    # CHANGE: CDC: allow each outer-parallel rank to emit its own checkpoint copy.
+    args = get_args()
+    if getattr(args, 'use_cdc', False):
+        dp_rank = mpu.get_data_parallel_rank()
+        cdc_rank = 0
+        try:
+            cdc_rank = mpu.get_cdc_parallel_rank()
+        except AssertionError:
+            cdc_rank = 0
+
+        base_dir = os.path.dirname(common_path)
+        leaf_dir = os.path.basename(common_path)
+        suffix = f'_cdc{cdc_rank:02d}'
+        if mpu.get_data_parallel_world_size() > 1:
+            suffix += f'_dp{dp_rank:02d}'
+        leaf_dir = f'{leaf_dir}{suffix}'
+        common_path = os.path.join(base_dir, leaf_dir)
+
     return os.path.join(common_path, basename)
 
 
@@ -169,34 +187,42 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     """
 
     # Look for checkpoint with no pipelining and no expert parallelism
-    filename = get_checkpoint_name(checkpoints_path, iteration, release,
-                                   pipeline_parallel=False,
-                                   tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=False, expert_rank=0)
+    filename = get_checkpoint_name(
+        checkpoints_path, iteration, release,
+        pipeline_parallel=False,
+        tensor_rank=0, pipeline_rank=0,
+        expert_parallel=False, expert_rank=0,
+    )
     if os.path.isfile(filename):
         return filename
 
     # Look for checkpoint with no pipelining and expert parallelism
-    filename = get_checkpoint_name(checkpoints_path, iteration, release,
-                                   pipeline_parallel=False,
-                                   tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=True, expert_rank=0)
+    filename = get_checkpoint_name(
+        checkpoints_path, iteration, release,
+        pipeline_parallel=False,
+        tensor_rank=0, pipeline_rank=0,
+        expert_parallel=True, expert_rank=0,
+    )
     if os.path.isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and no expert parallelism
-    filename = get_checkpoint_name(checkpoints_path, iteration, release,
-                                   pipeline_parallel=True,
-                                   tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=False, expert_rank=0)
+    filename = get_checkpoint_name(
+        checkpoints_path, iteration, release,
+        pipeline_parallel=True,
+        tensor_rank=0, pipeline_rank=0,
+        expert_parallel=False, expert_rank=0,
+    )
     if os.path.isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and expert parallelism
-    filename = get_checkpoint_name(checkpoints_path, iteration, release,
-                                   pipeline_parallel=True,
-                                   tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=True, expert_rank=0)
+    filename = get_checkpoint_name(
+        checkpoints_path, iteration, release,
+        pipeline_parallel=True,
+        tensor_rank=0, pipeline_rank=0,
+        expert_parallel=True, expert_rank=0,
+    )
     if os.path.isfile(filename):
         return filename
 
@@ -401,8 +427,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     # Collect args, model, RNG.
+    # CHANGE: CDC: Allow all ranks to save if use_cdc is enabled
+    should_save = (mpu.get_expert_data_parallel_rank() == 0)
+    if getattr(args, 'use_cdc', False):
+        should_save = True
+
     if not torch.distributed.is_initialized() \
-            or mpu.get_expert_data_parallel_rank() == 0 \
+            or should_save \
             or ckpt_type != CheckpointType.LEGACY:
         optim_sd_kwargs = {}
         if ckpt_type != CheckpointType.LEGACY and args.use_distributed_optimizer:
@@ -960,7 +991,9 @@ def _load_base_checkpoint(
         if rank0:
             checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         else:
-            checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
+            checkpoint_name = get_checkpoint_name(
+                load_dir, iteration, release, return_base_dir=False
+            )
         try:
             state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
@@ -1402,8 +1435,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 assert not is_torch_dist
                 tracker_filename = get_checkpoint_tracker_filename(load_dir)
                 iteration, release = read_metadata(tracker_filename)
-                model_checkpoint_name = \
-                    get_checkpoint_name(load_dir, iteration, release)
+                model_checkpoint_name = get_checkpoint_name(
+                    load_dir, iteration, release
+                )
                 optim_checkpoint_name = \
                     get_distributed_optimizer_checkpoint_name(
                         model_checkpoint_name)
@@ -1524,9 +1558,11 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     with open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
-    checkpoint_name = get_checkpoint_name(load_path, iteration,
-                                          args.use_distributed_optimizer,
-                                          release=False)
+    checkpoint_name = get_checkpoint_name(
+        load_path, iteration,
+        args.use_distributed_optimizer,
+        release=False,
+    )
 
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(

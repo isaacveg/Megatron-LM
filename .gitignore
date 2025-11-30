@@ -12,3 +12,8 @@ local/
 wandb/
 onelogger.log
 onelogger.err
+ckpts/*
+logs/*
+scripts/*
+**__pycache__/*
+**nohup.out
