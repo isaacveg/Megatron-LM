@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import math
 import torch
 import torch.distributed as dist
 from torch.optim import SGD
@@ -45,6 +46,7 @@ class CDCOptimizer(MegatronOptimizer):
         self.streaming_alpha = getattr(args, 'cdc_streaming_alpha', getattr(args, 'diloco_streaming_alpha', 0.5))
         self.delay = getattr(args, 'cdc_delay', getattr(args, 'diloco_delay', 0))
         self.dc_N = getattr(args, 'cdc_dc_N', getattr(args, 'diloco_dc_N', 4))
+        self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'sequential')
         self.verbose = getattr(args, 'cdc_verbose', False)
         
         # Initialize DiLoCo state
@@ -319,11 +321,8 @@ class CDCOptimizer(MegatronOptimizer):
     def _init_streaming_state(self):
         """Initialize state for Streaming/DC DiLoCo."""
         param_groups = self.get_main_param_groups()
-        all_params = [p for group in param_groups for p in group['params']]
-        
-        total_params = len(all_params)
-        shard_size = (total_params + self.num_shards - 1) // self.num_shards
-        
+        shard_param_refs, num_layers = self._build_layer_shards(param_groups)
+
         self.shard_tracker = {}
         
         # DC specific
@@ -333,11 +332,7 @@ class CDCOptimizer(MegatronOptimizer):
             if self.dc_h < 1:
                 self.dc_h = 1
         
-        for shard_idx in range(self.num_shards):
-            start_idx = shard_idx * shard_size
-            end_idx = min((shard_idx + 1) * shard_size, total_params)
-            shard_params_refs = all_params[start_idx:end_idx]
-            
+        for shard_idx, shard_params_refs in enumerate(shard_param_refs):
             shard_num_params = sum(p.numel() for p in shard_params_refs)
 
             tracker = {
@@ -372,6 +367,148 @@ class CDCOptimizer(MegatronOptimizer):
                 tracker["outer_optimizer"] = None
                 
             self.shard_tracker[shard_idx] = tracker
+
+        if self.verbose:
+            print_rank_0(
+                f"[CDC] Layer-aware sharding initialized: {num_layers} logical layers across {self.num_shards} shards (pattern={self.shard_pattern})."
+            )
+
+    def _build_layer_shards(self, param_groups):
+        """Derive layer-aware shard assignments following the requested pattern."""
+        ordered_params = []
+        seen = set()
+        for group in param_groups:
+            for param in group['params']:
+                if not param.requires_grad:
+                    continue
+                pid = id(param)
+                if pid in seen:
+                    continue
+                ordered_params.append(param)
+                seen.add(pid)
+
+        if not ordered_params:
+            raise RuntimeError("CDC optimizer could not find any trainable parameters to shard.")
+
+        param_position = {id(param): idx for idx, param in enumerate(ordered_params)}
+
+        layer_candidates = self._gather_layer_candidates()
+        covered = set()
+        layer_lists = []
+        for candidate in layer_candidates:
+            filtered = []
+            for param in candidate:
+                pid = id(param)
+                if pid not in param_position or pid in covered:
+                    continue
+                filtered.append(param)
+            if filtered:
+                filtered.sort(key=lambda p: param_position[id(p)])
+                layer_lists.append(filtered)
+                covered.update(id(p) for p in filtered)
+
+        for param in ordered_params:
+            pid = id(param)
+            if pid in covered:
+                continue
+            layer_lists.append([param])
+            covered.add(pid)
+
+        num_layers = len(layer_lists)
+        shards = [[] for _ in range(self.num_shards)]
+
+        if self.num_shards == 1:
+            shards[0] = ordered_params
+        else:
+            if self.shard_pattern == 'sequential':
+                layers_per_shard = math.ceil(num_layers / self.num_shards)
+                for idx, params in enumerate(layer_lists):
+                    shard_idx = min(idx // layers_per_shard, self.num_shards - 1)
+                    shards[shard_idx].extend(params)
+            elif self.shard_pattern == 'stride':
+                for idx, params in enumerate(layer_lists):
+                    shard_idx = idx % self.num_shards
+                    shards[shard_idx].extend(params)
+            else:
+                raise ValueError(f"Unsupported CDC shard pattern: {self.shard_pattern}")
+
+        for shard_idx, shard in enumerate(shards):
+            shards[shard_idx] = self._unique_preserve_order(shard)
+
+        if any(len(shard) == 0 for shard in shards):
+            raise ValueError(
+                "CDC layer sharding produced empty shards. Reduce --cdc-num-shards or choose a different pattern."
+            )
+
+        return shards, num_layers
+
+    def _gather_layer_candidates(self):
+        """Collect ordered per-layer parameter candidates from model chunks."""
+        candidates = []
+        for chunk in self.model_chunks or []:
+            candidates.extend(self._extract_chunk_layers(chunk))
+        return candidates
+
+    def _extract_chunk_layers(self, chunk):
+        layers = []
+        chunk_seen = set()
+
+        def add_module(module):
+            if module is None:
+                return
+            params = [p for p in module.parameters(recurse=True) if p.requires_grad]
+            filtered = [p for p in params if id(p) not in chunk_seen]
+            if filtered:
+                layers.append(filtered)
+                chunk_seen.update(id(p) for p in filtered)
+
+        if hasattr(chunk, 'embedding'):
+            add_module(chunk.embedding)
+
+        decoder = getattr(chunk, 'decoder', None)
+        if decoder is not None:
+            if hasattr(decoder, 'layers'):
+                for layer in decoder.layers:
+                    add_module(layer)
+            else:
+                add_module(decoder)
+            if getattr(decoder, 'final_layernorm', None) is not None:
+                add_module(decoder.final_layernorm)
+
+        if hasattr(chunk, 'layers'):
+            for layer in getattr(chunk, 'layers'):
+                add_module(layer)
+
+        if hasattr(chunk, 'final_layernorm'):
+            add_module(chunk.final_layernorm)
+
+        if hasattr(chunk, 'output_layer'):
+            add_module(chunk.output_layer)
+
+        if hasattr(chunk, 'lm_head'):
+            add_module(chunk.lm_head)
+
+        if hasattr(chunk, 'mtp'):
+            add_module(chunk.mtp)
+
+        remaining = [p for p in chunk.parameters() if p.requires_grad and id(p) not in chunk_seen]
+        if remaining:
+            layers.append(remaining)
+            chunk_seen.update(id(p) for p in remaining)
+
+        return layers
+
+    @staticmethod
+    def _unique_preserve_order(params):
+        seen = set()
+        ordered = []
+        for param in params:
+            pid = id(param)
+            if pid in seen:
+                continue
+            ordered.append(param)
+            seen.add(pid)
+        return ordered
 
     def step(self):
         """

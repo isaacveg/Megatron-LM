@@ -17,3 +17,4 @@ logs/*
 scripts/*
 **__pycache__/*
 **nohup.out
+results/*

@@ -2714,6 +2714,9 @@ def _add_cdc_args(parser):
                        help='Simulated communication delay (in steps) for Streaming-based methods.')
     group.add_argument('--cdc-streaming-alpha', type=float, default=0.5,
                        help='Alpha for Streaming DiLoCo blending (local = alpha * local + (1-alpha) * global).')
+    group.add_argument('--cdc-shard-pattern', type=str, default='sequential',
+                       choices=['sequential', 'stride'],
+                       help='Layer sharding pattern across CDC shards.')
     group.add_argument('--cdc-verbose', action='store_true',
                        help='Enable verbose logging for CDC optimizer.')
 
