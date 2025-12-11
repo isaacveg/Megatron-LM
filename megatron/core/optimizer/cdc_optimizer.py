@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import math
 import torch
 import torch.distributed as dist
 from torch.optim import SGD
@@ -46,9 +45,10 @@ class CDCOptimizer(MegatronOptimizer):
         self.streaming_alpha = getattr(args, 'cdc_streaming_alpha', getattr(args, 'diloco_streaming_alpha', 0.5))
         self.delay = getattr(args, 'cdc_delay', getattr(args, 'diloco_delay', 0))
         self.dc_N = getattr(args, 'cdc_dc_N', getattr(args, 'diloco_dc_N', 4))
-        self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'sequential')
+        self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'stride')
         self.verbose = getattr(args, 'cdc_verbose', False)
-        
+        if torch.distributed.get_rank() == 0: 
+            self._check_weight_tying()
         # Initialize DiLoCo state
         self.original_snapshot = None
         self.outer_optimizer = None
@@ -64,7 +64,43 @@ class CDCOptimizer(MegatronOptimizer):
             self._init_streaming_state()
         else:
             raise ValueError(f"Unknown DiLoCo algorithm: {self.algorithm}")
+    # 在你的代码中加入这段打印
+    def _check_weight_tying(self):
+        # 只有 rank0 打印，防止刷屏
+        if torch.distributed.get_rank() != 0:
+            return
 
+        print_rank_0("[CDC Check] Checking for Weight Tying...")
+        found_embedding = False
+        found_head = False
+        emb_id = None
+        head_id = None
+
+        # 注意这里要用 self.model_chunks
+        for chunk in self.model_chunks:
+            for name, param in chunk.named_parameters():
+                # 检查 Embedding
+                if 'embedding' in name and 'weight' in name:
+                    if 'position' not in name:
+                        emb_id = id(param)
+                        found_embedding = True
+                        print_rank_0(f"[CDC Check] Found Embedding: {name} (ID: {emb_id})")
+                
+                # 检查 Head
+                if ('output_layer' in name or 'head' in name) and 'weight' in name:
+                    if 'norm' not in name:
+                        head_id = id(param)
+                        found_head = True
+                        print_rank_0(f"[CDC Check] Found Head: {name} (ID: {head_id})")
+
+        if found_embedding and found_head:
+            if emb_id == head_id:
+                print_rank_0("[CDC Check] >>> DETECTED: Weight Tying is ON. (Embedding and Head share same memory)")
+            else:
+                print_rank_0("[CDC Check] >>> DETECTED: Weight Tying is OFF. (Different memory addresses)")
+        else:
+            # 如果没找到，可能是模型结构命名不一样，或者是 Pipeline Parallelism 导致当前 rank 只有部分层
+            pass
     @property
     def is_stub_optimizer(self):
         return getattr(self.inner_optimizer, 'is_stub_optimizer', False)
@@ -318,197 +354,325 @@ class CDCOptimizer(MegatronOptimizer):
                 nesterov=True,
             )
 
+    # def _init_streaming_state(self):
+    #     """
+    #     Initialize state for Streaming/DC DiLoCo using explicit Model Layer Structure.
+    #     Uses 'Alignment by Order' to map Model Params (Names) to Optimizer Params (Tensors).
+    #     """
+    #     # 1. 获取优化器管理的所有参数（展平列表）
+    #     # 注意：这通常是 FP32 Master Weights，与 model_chunks 里的参数对象不同，但顺序一致
+    #     optim_params_flat = []
+    #     for group in self.get_main_param_groups():
+    #         for p in group['params']:
+    #             optim_params_flat.append(p)
+        
+    #     total_optim_params = len(optim_params_flat)
+    #     self.shard_tracker = {}
+        
+    #     if self.verbose:
+    #         print_rank_0(f"[CDC] Initializing Shards. Found {total_optim_params} optimizer params.")
+
+    #     # -------------------------------------------------------
+    #     # 2. 逻辑分组 (Blocks): 遍历模型结构，按顺序认领优化器参数
+    #     # -------------------------------------------------------
+    #     blocks = []
+    #     current_block = []
+    #     current_layer_idx = -1 
+        
+    #     # 指向 optim_params_flat 的当前索引
+    #     optim_cursor = 0
+        
+    #     # 遍历 model chunks
+    #     for chunk in self.model_chunks:
+    #         # 只遍历需要梯度的参数，以保持和优化器列表对齐
+    #         # 注意：这里我们遍历的是 model 的参数名，用来判断结构
+    #         for name, param in chunk.named_parameters():
+    #             if not param.requires_grad:
+    #                 continue 
+
+    #             # 安全检查：防止模型参数多于优化器参数
+    #             if optim_cursor >= total_optim_params:
+    #                 if self.verbose:
+    #                     print_rank_0(f"[CDC] Warning: Model has more params than optimizer at {name}. Stopping alignment.")
+    #                 break
+
+    #             # === 关键点：取出对应的优化器参数 ===
+    #             # 我们使用 model 的 name 来判断层级，但保存 optimizer 的 tensor
+    #             target_param = optim_params_flat[optim_cursor]
+    #             optim_cursor += 1
+
+    #             # 解析层号: 'language_model.encoder.layers.0.self_attention...'
+    #             parts = name.split('.')
+    #             found_layer = False
+    #             layer_num = -1
+
+    #             if 'layers' in parts:
+    #                 try:
+    #                     idx = parts.index('layers')
+    #                     if idx + 1 < len(parts) and parts[idx+1].isdigit():
+    #                         layer_num = int(parts[idx+1])
+    #                         found_layer = True
+    #                 except (ValueError, IndexError):
+    #                     pass
+
+    #             # 状态机：检测层边界
+    #             if found_layer:
+    #                 if layer_num != current_layer_idx:
+    #                     if current_block:
+    #                         blocks.append(current_block)
+    #                         current_block = []
+    #                     current_layer_idx = layer_num
+    #                 current_block.append(target_param)
+    #             else:
+    #                 if current_layer_idx != -1: # 从 Layer 区域出来 (进入 Head)
+    #                     if current_block:
+    #                         blocks.append(current_block)
+    #                         current_block = []
+    #                     current_layer_idx = -1
+    #                 current_block.append(target_param)
+
+    #     # 添加最后一个 block (Tail)
+    #     if current_block:
+    #         blocks.append(current_block)
+
+    #     # 校验对齐情况
+    #     if optim_cursor != total_optim_params:
+    #         print_rank_0(f"[CDC] WARNING: Parameter count mismatch! Optimizer has {total_optim_params}, "
+    #                      f"but matched {optim_cursor} based on model structure. "
+    #                      f"This might affect DiLoCo accuracy.")
+
+    #     num_blocks = len(blocks)
+    #     if self.verbose:
+    #         print_rank_0(f"[CDC] Partitioned model into {num_blocks} blocks.")
+    #         print_rank_0(f"[CDC] Shard Pattern: {self.shard_pattern.upper()}")
+    #         if num_blocks == 0:
+    #             print_rank_0("[CDC] ERROR: 0 Blocks found! Check if model.requires_grad is set correctly.")
+
+    #     # -------------------------------------------------------
+    #     # 3. 根据 pattern 将 Blocks 分配给 Shards
+    #     # -------------------------------------------------------
+        
+    #     for shard_idx in range(self.num_shards):
+    #         shard_params_refs = []
+    #         assigned_block_indices = []
+
+    #         if num_blocks > 0:
+    #             if self.shard_pattern == 'contiguous':
+    #                 # 方式 A: 连续划分
+    #                 blocks_per_shard = (num_blocks + self.num_shards - 1) // self.num_shards
+    #                 start_block_idx = shard_idx * blocks_per_shard
+    #                 end_block_idx = min((shard_idx + 1) * blocks_per_shard, num_blocks)
+                    
+    #                 if start_block_idx < end_block_idx:
+    #                     for b_idx in range(start_block_idx, end_block_idx):
+    #                         shard_params_refs.extend(blocks[b_idx])
+    #                         assigned_block_indices.append(b_idx)
+                
+    #             elif self.shard_pattern == 'stride':
+    #                 # 方式 B: 交错划分 (Round-Robin)
+    #                 for b_idx, block in enumerate(blocks):
+    #                     if b_idx % self.num_shards == shard_idx:
+    #                         shard_params_refs.extend(block)
+    #                         assigned_block_indices.append(b_idx)
+            
+    #         # === 初始化 Tracker (即使是空的也要初始化，防止 KeyError) ===
+    #         shard_num_params_cnt = sum(p.numel() for p in shard_params_refs)
+            
+    #         tracker = {
+    #             "param_refs": shard_params_refs,
+    #             "params": [], 
+    #             "staged_params": [],
+    #             "sent_at_step": 0,
+    #             "old_sent_at_step": 0,
+    #             "next_receive_step": 0,
+    #             "global_num_params": shard_num_params_cnt,
+    #             "last_score": 0.0,
+    #         }
+
+    #         # 只有当分配到了参数时才进行 clone/offload
+    #         if shard_params_refs:
+    #             for p in shard_params_refs:
+    #                 if self.offload_outer_opt:
+    #                     tracker["params"].append(p.detach().to("cpu", copy=True))
+    #                     tracker["staged_params"].append(p.detach().to("cpu", copy=True))
+    #                 else:
+    #                     tracker["params"].append(p.detach().clone())
+    #                     tracker["staged_params"].append(p.detach().clone())
+
+    #             if self.outer_lr != 1.0:
+    #                 for p in tracker["params"]:
+    #                     p.requires_grad_(True)
+    #                 tracker["outer_optimizer"] = SGD(
+    #                     tracker["params"],
+    #                     lr=self.outer_lr,
+    #                     momentum=0.9,
+    #                     nesterov=True,
+    #                 )
+    #             else:
+    #                 tracker["outer_optimizer"] = None
+    #         else:
+    #             tracker["outer_optimizer"] = None
+
+    #         self.shard_tracker[shard_idx] = tracker
+            
+    #         if self.verbose:
+    #             shard_mb = shard_num_params_cnt * 4 / 1024**2 # Approx FP32 size
+    #             if assigned_block_indices:
+    #                 if self.shard_pattern == 'contiguous':
+    #                     idx_info = f"Blocks {assigned_block_indices[0]}-{assigned_block_indices[-1]}"
+    #                 else:
+    #                     idx_info = f"Blocks {assigned_block_indices[:3]}... (Count: {len(assigned_block_indices)})"
+    #             else:
+    #                 idx_info = "No Blocks Assigned"
+                    
+    #             print_rank_0(f"[CDC] Shard {shard_idx}: {idx_info} "
+    #                          f"({len(shard_params_refs)} tensors, {shard_mb:.2f} MB)")
     def _init_streaming_state(self):
-        """Initialize state for Streaming/DC DiLoCo."""
-        param_groups = self.get_main_param_groups()
-        shard_param_refs, num_layers = self._build_layer_shards(param_groups)
+        """
+        Initialize state for Streaming/DC DiLoCo using explicit Model Layer Structure.
+        Robust strategy: "Map by Unique ID" to handle Weight Tying.
+        """
+        # Step 1: 建立 [Model Param ID] -> [Optimizer Param Tensor] 的映射
+        # 1.1 收集所有优化器参数
+        optim_params_flat = []
+        for group in self.get_main_param_groups():
+            for p in group['params']:
+                optim_params_flat.append(p)
+        
+        # 1.2 收集所有模型参数
+        unique_model_params = []
+        for chunk in self.model_chunks:
+            for p in chunk.parameters():
+                if p.requires_grad:
+                    unique_model_params.append(p)
+        
+        # 1.3 校验数量并建立映射
+        if len(optim_params_flat) != len(unique_model_params):
+             print_rank_0(f"[CDC] CRITICAL ERROR: Optimizer has {len(optim_params_flat)} params, "
+                          f"but model has {len(unique_model_params)} unique params. Alignment impossible.")
+        
+        param_map = {} # Key: id(model_param), Value: optimizer_param_tensor
+        
+        min_len = min(len(optim_params_flat), len(unique_model_params))
+        for i in range(min_len):
+            m_p = unique_model_params[i]
+            o_p = optim_params_flat[i]
+            param_map[id(m_p)] = o_p
+            
+        if self.verbose:
+            print_rank_0(f"[CDC] Mapped {min_len} unique model params to optimizer params.")
 
+        # Step 2: 划分blocks
+        blocks = []
+        current_block = []
+        current_layer_idx = -1 
+        
         self.shard_tracker = {}
-        
-        # DC specific
-        self.dc_h = 1
-        if self.algorithm == 'dc':
-            self.dc_h = self.sync_interval // self.dc_N
-            if self.dc_h < 1:
-                self.dc_h = 1
-        
-        for shard_idx, shard_params_refs in enumerate(shard_param_refs):
-            shard_num_params = sum(p.numel() for p in shard_params_refs)
 
+        for chunk in self.model_chunks:
+            for name, param in chunk.named_parameters():
+                if not param.requires_grad:
+                    continue 
+                
+                if id(param) not in param_map:
+                    if self.verbose:
+                        print_rank_0(f"[CDC] Warning: Param {name} not found in alignment map. Skipping.")
+                    continue
+                
+                target_param = param_map[id(param)]
+
+                parts = name.split('.')
+                found_layer = False
+                layer_num = -1
+                if 'layers' in parts:
+                    try:
+                        idx = parts.index('layers')
+                        if idx + 1 < len(parts) and parts[idx+1].isdigit():
+                            layer_num = int(parts[idx+1])
+                            found_layer = True
+                    except (ValueError, IndexError):
+                        pass
+
+                if found_layer:
+                    if layer_num != current_layer_idx:
+                        if current_block:
+                            blocks.append(current_block)
+                            current_block = []
+                        current_layer_idx = layer_num
+                    current_block.append(target_param)
+                else:
+                    if current_layer_idx != -1: 
+                        if current_block:
+                            blocks.append(current_block)
+                            current_block = []
+                        current_layer_idx = -1
+                    current_block.append(target_param)
+
+        if current_block:
+            blocks.append(current_block)
+
+        num_blocks = len(blocks)
+        if self.verbose:
+            print_rank_0(f"[CDC] Partitioned model into {num_blocks} blocks.")
+
+        # Step 3: 分配给 Shards
+        for shard_idx in range(self.num_shards):
+            shard_params_refs = []
+            
+            if num_blocks > 0:
+                if self.shard_pattern == 'sequential':
+                    blocks_per_shard = (num_blocks + self.num_shards - 1) // self.num_shards
+                    start_block_idx = shard_idx * blocks_per_shard
+                    end_block_idx = min((shard_idx + 1) * blocks_per_shard, num_blocks)
+                    if start_block_idx < end_block_idx:
+                        for b_idx in range(start_block_idx, end_block_idx):
+                            shard_params_refs.extend(blocks[b_idx])
+                
+                elif self.shard_pattern == 'stride':
+                    for b_idx, block in enumerate(blocks):
+                        if b_idx % self.num_shards == shard_idx:
+                            shard_params_refs.extend(block)
+            
+            # Tracker 初始化
+            shard_num_params_cnt = sum(p.numel() for p in shard_params_refs)
             tracker = {
                 "param_refs": shard_params_refs,
-                "params": [], # Snapshot/Master copy (Global)
-                "staged_params": [], # For DC: Snapshot of local params at send time
+                "params": [], 
+                "staged_params": [],
                 "sent_at_step": 0,
-                "old_sent_at_step": 0, # For DC
-                "next_receive_step": 0, # For DC
-                "global_num_params": shard_num_params,
-                "last_score": 0.0, # For selection
+                "old_sent_at_step": 0,
+                "next_receive_step": 0,
+                "global_num_params": shard_num_params_cnt,
+                "last_score": 0.0,
             }
-            
-            for p in shard_params_refs:
-                if self.offload_outer_opt:
-                    tracker["params"].append(p.detach().to("cpu", copy=True))
-                    tracker["staged_params"].append(p.detach().to("cpu", copy=True))
+
+            if shard_params_refs:
+                for p in shard_params_refs:
+                    if self.offload_outer_opt:
+                        tracker["params"].append(p.detach().to("cpu", copy=True))
+                        tracker["staged_params"].append(p.detach().to("cpu", copy=True))
+                    else:
+                        tracker["params"].append(p.detach().clone())
+                        tracker["staged_params"].append(p.detach().clone())
+
+                if self.outer_lr != 1.0:
+                    for p in tracker["params"]:
+                        p.requires_grad_(True)
+                    tracker["outer_optimizer"] = SGD(
+                        tracker["params"],
+                        lr=self.outer_lr,
+                        momentum=0.9,
+                        nesterov=True,
+                    )
                 else:
-                    tracker["params"].append(p.detach().clone())
-                    tracker["staged_params"].append(p.detach().clone())
-            
-            if self.outer_lr != 1.0:
-                for p in tracker["params"]:
-                    p.requires_grad_(True)
-                tracker["outer_optimizer"] = SGD(
-                    tracker["params"],
-                    lr=self.outer_lr,
-                    momentum=0.9,
-                    nesterov=True,
-                )
+                    tracker["outer_optimizer"] = None
             else:
                 tracker["outer_optimizer"] = None
-                
+
             self.shard_tracker[shard_idx] = tracker
-
-        if self.verbose:
-            print_rank_0(
-                f"[CDC] Layer-aware sharding initialized: {num_layers} logical layers across {self.num_shards} shards (pattern={self.shard_pattern})."
-            )
-
-    def _build_layer_shards(self, param_groups):
-        """Derive layer-aware shard assignments following the requested pattern."""
-        ordered_params = []
-        seen = set()
-        for group in param_groups:
-            for param in group['params']:
-                if not param.requires_grad:
-                    continue
-                pid = id(param)
-                if pid in seen:
-                    continue
-                ordered_params.append(param)
-                seen.add(pid)
-
-        if not ordered_params:
-            raise RuntimeError("CDC optimizer could not find any trainable parameters to shard.")
-
-        param_position = {id(param): idx for idx, param in enumerate(ordered_params)}
-
-        layer_candidates = self._gather_layer_candidates()
-        covered = set()
-        layer_lists = []
-        for candidate in layer_candidates:
-            filtered = []
-            for param in candidate:
-                pid = id(param)
-                if pid not in param_position or pid in covered:
-                    continue
-                filtered.append(param)
-            if filtered:
-                filtered.sort(key=lambda p: param_position[id(p)])
-                layer_lists.append(filtered)
-                covered.update(id(p) for p in filtered)
-
-        for param in ordered_params:
-            pid = id(param)
-            if pid in covered:
-                continue
-            layer_lists.append([param])
-            covered.add(pid)
-
-        num_layers = len(layer_lists)
-        shards = [[] for _ in range(self.num_shards)]
-
-        if self.num_shards == 1:
-            shards[0] = ordered_params
-        else:
-            if self.shard_pattern == 'sequential':
-                layers_per_shard = math.ceil(num_layers / self.num_shards)
-                for idx, params in enumerate(layer_lists):
-                    shard_idx = min(idx // layers_per_shard, self.num_shards - 1)
-                    shards[shard_idx].extend(params)
-            elif self.shard_pattern == 'stride':
-                for idx, params in enumerate(layer_lists):
-                    shard_idx = idx % self.num_shards
-                    shards[shard_idx].extend(params)
-            else:
-                raise ValueError(f"Unsupported CDC shard pattern: {self.shard_pattern}")
-
-        for shard_idx, shard in enumerate(shards):
-            shards[shard_idx] = self._unique_preserve_order(shard)
-
-        if any(len(shard) == 0 for shard in shards):
-            raise ValueError(
-                "CDC layer sharding produced empty shards. Reduce --cdc-num-shards or choose a different pattern."
-            )
-
-        return shards, num_layers
-
-    def _gather_layer_candidates(self):
-        """Collect ordered per-layer parameter candidates from model chunks."""
-        candidates = []
-        for chunk in self.model_chunks or []:
-            candidates.extend(self._extract_chunk_layers(chunk))
-        return candidates
-
-    def _extract_chunk_layers(self, chunk):
-        layers = []
-        chunk_seen = set()
-
-        def add_module(module):
-            if module is None:
-                return
-            params = [p for p in module.parameters(recurse=True) if p.requires_grad]
-            filtered = [p for p in params if id(p) not in chunk_seen]
-            if filtered:
-                layers.append(filtered)
-                chunk_seen.update(id(p) for p in filtered)
-
-        if hasattr(chunk, 'embedding'):
-            add_module(chunk.embedding)
-
-        decoder = getattr(chunk, 'decoder', None)
-        if decoder is not None:
-            if hasattr(decoder, 'layers'):
-                for layer in decoder.layers:
-                    add_module(layer)
-            else:
-                add_module(decoder)
-            if getattr(decoder, 'final_layernorm', None) is not None:
-                add_module(decoder.final_layernorm)
-
-        if hasattr(chunk, 'layers'):
-            for layer in getattr(chunk, 'layers'):
-                add_module(layer)
-
-        if hasattr(chunk, 'final_layernorm'):
-            add_module(chunk.final_layernorm)
-
-        if hasattr(chunk, 'output_layer'):
-            add_module(chunk.output_layer)
-
-        if hasattr(chunk, 'lm_head'):
-            add_module(chunk.lm_head)
-
-        if hasattr(chunk, 'mtp'):
-            add_module(chunk.mtp)
-
-        remaining = [p for p in chunk.parameters() if p.requires_grad and id(p) not in chunk_seen]
-        if remaining:
-            layers.append(remaining)
-            chunk_seen.update(id(p) for p in remaining)
-
-        return layers
-
-    @staticmethod
-    def _unique_preserve_order(params):
-        seen = set()
-        ordered = []
-        for param in params:
-            pid = id(param)
-            if pid in seen:
-                continue
-            ordered.append(param)
-            seen.add(pid)
-        return ordered
+            
+            if self.verbose:
+                 print_rank_0(f"[CDC] Shard {shard_idx} initialized with {len(shard_params_refs)} tensors.")
 
     def step(self):
         """
