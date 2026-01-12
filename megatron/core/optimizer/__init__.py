@@ -591,20 +591,7 @@ def get_megatron_optimizer(
         )
 
     # CHANGE: combine optimizers and optionally wrap with CDC optimizer
-    base_optimizer: MegatronOptimizer
-    if len(optimizers) == 1:
-        base_optimizer = optimizers[0]
-    else:
-        base_optimizer = ChainedOptimizer(optimizers)
-
-    # Optionally wrap with CDC (cross data-center) optimizer.
-    # We rely on args attached to the first model chunk's config.
-    args = getattr(config, 'args', None)
-    if args is not None and getattr(args, 'use_cdc', False):
-        base_optimizer = CDCOptimizer(
-            inner_optimizer=base_optimizer,
-            args=args,  # args are passed for CDC config, see training.py
-            model_chunks=model_chunks,
-        )
-
-    return base_optimizer
+    from megatron.training.global_vars import get_args
+    args = get_args()
+    return CDCOptimizer(
+        ChainedOptimizer(optimizers)) if getattr(args, 'use_cdc', False) else ChainedOptimizer(optimizers)
