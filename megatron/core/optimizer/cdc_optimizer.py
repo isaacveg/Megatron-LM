@@ -782,12 +782,13 @@ class CDCOptimizer(MegatronOptimizer):
 
         # 4. Outer Optimizer Step (Update Global)
         if tracker["outer_optimizer"]:
-            for p_global, avg_delta in zip(global_params, sync_grads):
-                if p_global.grad is None:
-                    p_global.grad = torch.zeros_like(p_global.data)
-                p_global.grad.copy_(avg_delta)
-            tracker["outer_optimizer"].step()
-            tracker["outer_optimizer"].zero_grad(set_to_none=True)
+            if len(global_params) > 0:
+                for p_global, avg_delta in zip(global_params, sync_grads):
+                    if p_global.grad is None:
+                        p_global.grad = torch.zeros_like(p_global.data)
+                    p_global.grad.copy_(avg_delta)
+                tracker["outer_optimizer"].step()
+                tracker["outer_optimizer"].zero_grad(set_to_none=True)
         else:
             # Simple averaging
             for p_global, avg_delta in zip(global_params, sync_grads):
@@ -852,6 +853,11 @@ class CDCOptimizer(MegatronOptimizer):
     def _all_reduce_flattened(self, tensors):
         """Helper to flatten, all-reduce, and unflatten tensors."""
         from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+        # Empty tensor list is a valid no-op (e.g., shards that are empty on this PP stage).
+        if not tensors:
+            print_rank_0("[CDC] Warning: _all_reduce_flattened called with empty tensor list. No operation performed.")
+            return
 
         start_time = time.time()
         total_bytes = 0
