@@ -593,5 +593,6 @@ def get_megatron_optimizer(
     # CHANGE: combine optimizers and optionally wrap with CDC optimizer
     from megatron.training.global_vars import get_args
     args = get_args()
+    # CHANGE: model_chunks passed to CDCOptimizer for model sharding
     return CDCOptimizer(
-        ChainedOptimizer(optimizers)) if getattr(args, 'use_cdc', False) else ChainedOptimizer(optimizers)
+        ChainedOptimizer(optimizers), model_chunks) if getattr(args, 'use_cdc', False) else ChainedOptimizer(optimizers)

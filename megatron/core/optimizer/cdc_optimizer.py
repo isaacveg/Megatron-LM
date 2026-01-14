@@ -4,8 +4,9 @@ import torch
 import torch.distributed as dist
 from torch.optim import SGD
 from copy import deepcopy
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import time
+import re
 
 from megatron.core import mpu
 from megatron.training.utils import print_rank_0
@@ -22,15 +23,19 @@ class CDCOptimizer(MegatronOptimizer):
 
     def __init__(
         self,
-        inner_optimizer: MegatronOptimizer
+        inner_optimizer: MegatronOptimizer,
+        model_chunks: Optional[List[MegatronModule]] = None
     ):
         self.inner_optimizer = inner_optimizer
-        # 非分布式优化器用不上
-        # self.model_chunks = self.inner_optimizer.model_chunks
+        # 要引用模型的chunks以便划分参数；优先显式传入，其次复用内层优化器携带的 model_chunks
+        self.model_chunks = model_chunks if model_chunks is not None else getattr(inner_optimizer, "model_chunks", None)
+        assert self.model_chunks is not None, "model_chunks must be provided to CDCOptimizer."
         self.config = self.inner_optimizer.config
 
         # 获取参数
         args = get_args()
+        self.tie_embeddings = not args.untie_embeddings_and_output_weights
+        # assert args.untie_embeddings_and_output_weights, "CDC does not support tied embeddings and output weights."
         self.cdc_group = mpu.get_cdc_parallel_group()
         self.sync_interval = getattr(args, 'cdc_sync_interval', getattr(args, 'diloco_sync_interval', 100))
         self.step_count = 0
@@ -45,10 +50,12 @@ class CDCOptimizer(MegatronOptimizer):
         self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'stride')
         self.verbose = getattr(args, 'cdc_verbose', False)
         self.mixed_precision = getattr(args, 'bf16', False) or getattr(args, 'fp16', False)
+        # Initialized for all algorithms so checkpoint/state construction does not fail.
+        self.next_shard_idx = 0
 
         if self.verbose:
             print_rank_0(f"[CDC] Initialized {self.algorithm} optimizer. Sync interval: {self.sync_interval}, Shards: {self.num_shards}")
-
+        
         if self.algorithm == 'diloco':
             self._init_diloco_state()
         elif self.algorithm in ['streaming', 'dc']:
@@ -63,6 +70,23 @@ class CDCOptimizer(MegatronOptimizer):
     @property
     def optimizer(self):
         return self.inner_optimizer.optimizer
+    
+    @property
+    def main_param_list(self):
+        """返回optimizer的param groups展平后的列表"""
+        return [p for g in self.param_groups for p in g['params']] 
+    
+    @property
+    def model_param_list(self):
+        """返回遍历model_chunks后保存到一个展平列表的params
+        named_parameters()会自动去重
+        """
+        model_param_list = []
+        for chunk in self.model_chunks:
+            for name, p in chunk.named_parameters():
+                if p.requires_grad:
+                    model_param_list.append(p)
+        return model_param_list
 
     def get_loss_scale(self):
         return self.inner_optimizer.get_loss_scale()
@@ -78,14 +102,12 @@ class CDCOptimizer(MegatronOptimizer):
         }
 
     def load_state_dict(self, state_dict):
-        """Load optimizer state including CDC metadata (backward compatible)."""
-        if "inner_optimizer" not in state_dict:
-            # Backward compatibility with checkpoints saved before CDC support.
+        """Load optimizer state including CDC metadata (compatible with normal checkpoint)."""
+        if "inner_optimizer" not in state_dict: # Normal checkpoint without CDC metadata
             self.inner_optimizer.load_state_dict(state_dict)
-            return
-
-        self.inner_optimizer.load_state_dict(state_dict["inner_optimizer"])
-        self._load_cdc_state(state_dict.get("cdc_state"))
+        else:   # CDC checkpoint
+            self.inner_optimizer.load_state_dict(state_dict["inner_optimizer"])
+            self._load_cdc_state(state_dict.get("cdc_state"))
 
     def zero_grad(self, set_to_none=True):
         self.inner_optimizer.zero_grad(set_to_none)
@@ -105,6 +127,24 @@ class CDCOptimizer(MegatronOptimizer):
     # Checkpoint helpers
     # ------------------------------------------------------------------
 
+    def _serialize_diloco_state(self):
+        """Return original_snapshot list and outer_optimizer state."""
+        # Optimization: If we just synced, original_snapshot == local params.
+        # We can skip saving it to avoid redundancy.
+        snapshot = None
+        if not (self.step_count > 0 and self.step_count % self.sync_interval == 0):
+            snapshot = [p.detach().to('cpu', copy=True) for p in self.original_snapshot or []]
+
+        outer_state = None
+        if self.outer_optimizer is not None:
+            outer_state = self.outer_optimizer.state_dict()
+            # outer_state = self._optimizer_state_to_cpu(self.outer_optimizer.state_dict())
+
+        return {
+            "original_snapshot": snapshot,
+            "outer_optimizer": outer_state,
+        }
+
     def _build_cdc_state(self):
         state = {
             "algorithm": self.algorithm,
@@ -112,32 +152,12 @@ class CDCOptimizer(MegatronOptimizer):
             "next_shard_idx": self.next_shard_idx,
         }
 
-        if self.algorithm == 'diloco' and self.original_snapshot is not None:
+        if self.algorithm == 'diloco' and getattr(self, "original_snapshot", None) is not None:
             state["diloco"] = self._serialize_diloco_state()
-        elif self.algorithm in ['streaming', 'dc'] and self.shard_tracker is not None:
+        elif self.algorithm in ['streaming', 'dc'] and getattr(self, "shard_tracker", None) is not None:
             state["shards"] = self._serialize_shard_trackers()
 
         return state
-
-    def _serialize_diloco_state(self):
-        # Optimization: If we just synced, original_snapshot == local params.
-        # We can skip saving it to avoid redundancy.
-        if self.step_count > 0 and self.step_count % self.sync_interval == 0:
-            snapshot = None
-        else:
-            snapshot = []
-            for group in self.original_snapshot or []:
-                serialized = [self._clone_tensor_to_cpu(p) for p in group]
-                snapshot.append(serialized)
-
-        outer_state = None
-        if self.outer_optimizer is not None:
-            outer_state = self._optimizer_state_to_cpu(self.outer_optimizer.state_dict())
-
-        return {
-            "original_snapshot": snapshot,
-            "outer_optimizer": outer_state,
-        }
 
     def _serialize_shard_trackers(self):
         shards = []
@@ -192,6 +212,11 @@ class CDCOptimizer(MegatronOptimizer):
         return cpu_state
 
     def _load_cdc_state(self, cdc_state):
+        """Load CDC metadata from checkpoint state.
+        Including: step_count, algorithm, next_shard_idx, diloco/shards;
+        Diloco: original_snapshot, outer_optimizer;
+        Shards: list, each with params, staged_params, sent_at_step, next_receive_step, outer_optimizer.
+        """
         if not cdc_state:
             return
         
@@ -202,42 +227,28 @@ class CDCOptimizer(MegatronOptimizer):
             )
 
         self.step_count = cdc_state.get("step_count", self.step_count)
+        self.next_shard_idx = cdc_state.get("next_shard_idx", self.next_shard_idx)
 
         if self.algorithm == 'diloco':
             self._load_diloco_state(cdc_state.get("diloco"))
         elif self.algorithm in ['streaming', 'dc']:
-            self.next_shard_idx = cdc_state.get("next_shard_idx", self.next_shard_idx)
             self._load_shard_trackers(cdc_state.get("shards"))
 
     def _load_diloco_state(self, diloco_state):
         if not diloco_state:
             return
 
-        if self.original_snapshot is None:
-            self._init_diloco_state()
-
-        snapshot = diloco_state.get("original_snapshot")
+        snapshot = diloco_state.get("original_snapshot", None)
 
         # Optimization: If snapshot is None, it means it was identical to local params.
         if snapshot is None:
-            param_groups = self.param_groups
-            for target_group, local_group in zip(self.original_snapshot, param_groups):
-                for target_tensor, local_tensor in zip(target_group, local_group['params']):
-                    if self.offload_outer_opt:
-                        target_tensor.data.copy_(local_tensor.detach().to("cpu"))
-                    else:
-                        target_tensor.data.copy_(local_tensor.data)
+            for target, local in zip(self.original_snapshot, self.model_param_list):
+                self._copy_tensor_data(target, local)
         else:
-            if len(snapshot) != len(self.original_snapshot):
-                raise ValueError("Mismatch in DiLoCo snapshot group count while loading checkpoint.")
+            for target, saved in zip(self.original_snapshot, snapshot):
+                self._copy_tensor_data(target, saved)
 
-            for target_group, saved_group in zip(self.original_snapshot, snapshot):
-                if len(saved_group) != len(target_group):
-                    raise ValueError("Mismatch in DiLoCo snapshot tensor count while loading checkpoint.")
-                for target_tensor, saved_tensor in zip(target_group, saved_group):
-                    self._copy_tensor_data(target_tensor, saved_tensor)
-
-        if self.outer_optimizer is not None and diloco_state.get("outer_optimizer") is not None:
+        if self.outer_optimizer is not None:
             self.outer_optimizer.load_state_dict(diloco_state["outer_optimizer"])
 
     def _load_shard_trackers(self, shard_states):
@@ -280,30 +291,23 @@ class CDCOptimizer(MegatronOptimizer):
             self._copy_tensor_data(target_tensor, saved_tensor)
 
     @staticmethod
-    def _clone_tensor_to_cpu(tensor):
-        if tensor.device.type == 'cpu':
-            return tensor.detach().clone()
-        return tensor.detach().to('cpu')
-
-    @staticmethod
     def _copy_tensor_data(target_tensor, saved_tensor):
+        """Copy saved_tensor data into target_tensor, handling device and dtype."""
         with torch.no_grad():
-            target_tensor.data.copy_(
+            target_tensor.copy_(
                 saved_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
             )
 
     def _init_diloco_state(self):
         """Initialize state for standard DiLoCo."""
-        self.original_snapshot = [] # 为了计算伪梯度保存的上一次快照
-        
-        for group in self.param_groups:
-            snapshot_group = []
-            for param in group['params']:
-                if self.offload_outer_opt:
-                    snapshot_group.append(param.detach().to("cpu", copy=True).require_grad_(True))
-                else:
-                    snapshot_group.append(param.detach().clone().require_grad_(True))
-            self.original_snapshot.append(snapshot_group)
+        self.original_snapshot = []  # 上一次同步时的模型参数快照（展平列表）
+
+        for param in self.model_param_list:
+            if self.offload_outer_opt:
+                cloned = param.detach().to("cpu", copy=True)
+            else:
+                cloned = param.detach().clone()
+            self.original_snapshot.append(cloned.requires_grad_(True))
 
         # Initialize outer optimizer (Nesterov SGD)
         if self.outer_lr != 1.0:
@@ -318,171 +322,268 @@ class CDCOptimizer(MegatronOptimizer):
 
     def _init_streaming_state(self):
         """
-        Initialize state for Streaming/DC DiLoCo using explicit Model Layer Structure.
-        Robust strategy: Use 'untie_embeddings_and_output_weights' arg and Unique ID to handle Weight Tying.
+        Initialize state for Streaming/DC DiLoCo.
+        一个模型的结构：
+        Embeddings:
+        - embedding.word_embeddings.weight
+        - embedding.position_embeddings.weight(RoPE 没有)
+        Decoder layers:
+        - decoder.layers.<0-N>.
+            - self_attention.
+                - linear_proj.weight
+                - linear_qkv.
+                    - weight
+                    - bias (disable了)
+                    - layer_norm_weight
+            - mlp.fc1.
+                - layer_norm_weight
+                - weight
+                - bias (disable了)
+            - mlp.fc2.
+                - weight
+                - bias (disable了)
+        - decoder.final_layernorm.weight
+        Output Layer:
+        - output_layer.weight (tied or untied)
         """
-        # Step 1: 建立 [Model Param ID] -> [Optimizer Param Tensor] 的映射
-        # 1.1 收集所有优化器参数
-        optim_params_flat = []
-        for group in self.param_groups:
-            for p in group['params']:
-                optim_params_flat.append(p)
+        # Build a deterministic shard plan from parameter names.
+        # Note:
+        # - CDC group is formed across outer-DP ranks that share the same PP/TP partition.
+        # - To get a *global* shard selection across pipeline stages, we aggregate per-shard metadata
+        #   (num_params, score) across TP and PP groups using scalar all-reduces.
 
-        # 1.2 收集所有模型参数，显式处理 Weight Tying
-        unique_model_params = []
-        seen_param_ids = set()
-        self.next_shard_idx = 0
-        
-        # 读取全局 args 中的权重共享配置（不要使用 optimizer init 传入的 args）
+        if self.num_shards < 1:
+            raise ValueError(f"cdc_num_shards must be >= 1, got {self.num_shards}")
+
+        # Number of embedding shards.
+        # tied: one shard for embeddings (output weights are tied and will only appear once).
+        # untied: two shards: input embeddings, and output embedding/LM head.
+        embedding_shards = 1 if self.tie_embeddings else 2
+        if self.num_shards < embedding_shards:
+            raise ValueError(
+                f"cdc_num_shards ({self.num_shards}) must be >= {embedding_shards} "
+                f"for tie_embeddings={self.tie_embeddings}."
+            )
+
+        # Remaining shards are used for decoder layers.
+        decoder_shards = max(self.num_shards - embedding_shards, 0)
+
+        # Determine total number of decoder layers (global) from args, fallback to local discovery.
         args = get_args()
-        untie_embeddings = getattr(args, 'untie_embeddings_and_output_weights', True)
+        num_layers = getattr(args, 'num_layers', None)
+        if num_layers is None:
+            num_layers = getattr(args, 'decoder_num_layers', None)
+        if num_layers is None:
+            # Fallback: infer from local parameter names.
+            local_layer_ids = set()
+            for name, _ in self._iter_named_trainable_params_unique(self.model_chunks):
+                layer_idx = self._parse_layer_index(name)
+                if layer_idx is not None:
+                    local_layer_ids.add(layer_idx)
+            num_layers = (max(local_layer_ids) + 1) if local_layer_ids else 0
 
-        for chunk in self.model_chunks:
-            for p in chunk.parameters():
-                if p.requires_grad:
-                    p_id = id(p)
-                    if p_id not in seen_param_ids:
-                        unique_model_params.append(p)
-                        seen_param_ids.add(p_id)
-                    elif not untie_embeddings and getattr(p, "shared", False):
-                        # 符合 args 配置的权重共享情况，已通过 id 判断为重复，跳过
-                        continue
+        if decoder_shards == 0 and num_layers > 0:
+            raise ValueError(
+                f"cdc_num_shards ({self.num_shards}) is insufficient: embeddings use {embedding_shards} shard(s) "
+                f"and decoder layers require at least 1 more shard (num_layers={num_layers})."
+            )
 
-        # 1.3 校验数量并建立映射
-        if len(optim_params_flat) != len(unique_model_params):
-             print_rank_0(f"[CDC] CRITICAL ERROR: Optimizer has {len(optim_params_flat)} params, "
-                          f"but model has {len(unique_model_params)} unique params. Alignment impossible. "
-                          f"Weight tying status: untie_embeddings={untie_embeddings}")
+        if self.shard_pattern not in ['stride', 'sequential']:
+            raise ValueError(f"Unknown cdc_shard_pattern: {self.shard_pattern}")
 
-        param_map = {} # Key: id(model_param), Value: optimizer_param_tensor
-
-        min_len = min(len(optim_params_flat), len(unique_model_params))
-        for i in range(min_len):
-            m_p = unique_model_params[i]
-            o_p = optim_params_flat[i]
-            param_map[id(m_p)] = o_p
+        # Build local shard assignment: shard_idx -> list[param_ref]
+        shard_to_param_refs: Dict[int, List[torch.nn.Parameter]] = {i: [] for i in range(self.num_shards)}
+        unique_named_params = self._iter_named_trainable_params_unique(self.model_chunks)
+        for name, param in unique_named_params:
+            # 如果tie embedding，只用一个 shard 存output layer和input layer
+            # 否则用 0 存 embedding，1 存 output layer
+            shard_idx = self._assign_param_to_shard(
+                name=name,
+                num_layers=num_layers,
+                embedding_shards=embedding_shards,
+                decoder_shards=decoder_shards,
+            )
+            shard_to_param_refs[shard_idx].append(param)
 
         if self.verbose:
-            print_rank_0(f"[CDC] Mapped {min_len} unique model params to optimizer params.")
-        # Step 2: 划分blocks
-        blocks = []
-        current_block = []
-        current_layer_idx = -1
+            assigned = sum(len(v) for v in shard_to_param_refs.values())
+            expected = len(unique_named_params)
+            if assigned != expected:
+                print_rank_0(f"[CDC] Warning: Assigned {assigned} params to shards, expected {expected}.")
 
+        # Initialize trackers.
         self.shard_tracker = {}
-        seen_in_blocks = set()
+        self.next_shard_idx = 0
 
-        for chunk in self.model_chunks:
-            for name, param in chunk.named_parameters():
-                if not param.requires_grad:
-                    continue
+        tp_group = mpu.get_tensor_model_parallel_group()
+        pp_group = mpu.get_pipeline_model_parallel_group()
 
-                # 处理 Weight Tying，避免同一个物理参数被划分到多个 blocks
-                param_id = id(param)
-                if param_id in seen_in_blocks:
-                    continue
-                seen_in_blocks.add(param_id)
-
-                if param_id not in param_map:
-                    if self.verbose:
-                        print_rank_0(f"[CDC] Warning: Param {name} not found in alignment map. Skipping.")
-                    continue
-
-                target_param = param_map[id(param)]
-
-                parts = name.split('.')
-                found_layer = False
-                layer_num = -1
-                if 'layers' in parts:
-                    try:
-                        idx = parts.index('layers')
-                        if idx + 1 < len(parts) and parts[idx+1].isdigit():
-                            layer_num = int(parts[idx+1])
-                            found_layer = True
-                    except (ValueError, IndexError):
-                        pass
-
-                if found_layer:
-                    if layer_num != current_layer_idx:
-                        if current_block:
-                            blocks.append(current_block)
-                            current_block = []
-                        current_layer_idx = layer_num
-                    current_block.append(target_param)
-                else:
-                    if current_layer_idx != -1:
-                        if current_block:
-                            blocks.append(current_block)
-                            current_block = []
-                        current_layer_idx = -1
-                    current_block.append(target_param)
-
-        if current_block:
-            blocks.append(current_block)
-
-        num_blocks = len(blocks)
-        if self.verbose:
-            print_rank_0(f"[CDC] Partitioned model into {num_blocks} blocks.")
-
-        # Step 3: 分配给 Shards
         for shard_idx in range(self.num_shards):
-            shard_params_refs = []
+            param_refs = shard_to_param_refs.get(shard_idx, [])
 
-            if num_blocks > 0:
-                if self.shard_pattern == 'sequential':
-                    blocks_per_shard = (num_blocks + self.num_shards - 1) // self.num_shards
-                    start_block_idx = shard_idx * blocks_per_shard
-                    end_block_idx = min((shard_idx + 1) * blocks_per_shard, num_blocks)
-                    if start_block_idx < end_block_idx:
-                        for b_idx in range(start_block_idx, end_block_idx):
-                            shard_params_refs.extend(blocks[b_idx])
-
-                elif self.shard_pattern == 'stride':
-                    for b_idx, block in enumerate(blocks):
-                        if b_idx % self.num_shards == shard_idx:
-                            shard_params_refs.extend(block)
-
-            # Tracker 初始化
-            shard_num_params_cnt = sum(p.numel() for p in shard_params_refs)
             tracker = {
-                "param_refs": shard_params_refs,
+                "param_refs": param_refs,
                 "params": [],
                 "staged_params": [],
                 "sent_at_step": 0,
                 "old_sent_at_step": 0,
                 "next_receive_step": 0,
-                "global_num_params": shard_num_params_cnt,
+                "global_num_params": 0,
                 "last_score": 0.0,
             }
 
-            if shard_params_refs:
-                for p in shard_params_refs:
-                    if self.offload_outer_opt:
-                        tracker["params"].append(p.detach().to("cpu", copy=True))
-                        tracker["staged_params"].append(p.detach().to("cpu", copy=True))
-                    else:
-                        tracker["params"].append(p.detach().clone())
-                        tracker["staged_params"].append(p.detach().clone())
-
-                if self.outer_lr != 1.0:
-                    for p in tracker["params"]:
-                        p.requires_grad_(True)
-                    tracker["outer_optimizer"] = SGD(
-                        tracker["params"],
-                        lr=self.outer_lr,
-                        momentum=0.9,
-                        nesterov=True,
-                    )
+            # Clone for global / staged buffers.
+            for p in param_refs:
+                if self.offload_outer_opt:
+                    tracker["params"].append(p.detach().to("cpu", copy=True))
+                    tracker["staged_params"].append(p.detach().to("cpu", copy=True))
                 else:
-                    tracker["outer_optimizer"] = None
+                    tracker["params"].append(p.detach().clone())
+                    tracker["staged_params"].append(p.detach().clone())
+
+            # Outer optimizer on the per-shard global params (optional).
+            if self.outer_lr != 1.0 and len(tracker["params"]) > 0:
+                for p in tracker["params"]:
+                    p.requires_grad_(True)
+                tracker["outer_optimizer"] = SGD(
+                    tracker["params"],
+                    lr=self.outer_lr,
+                    momentum=0.9,
+                    nesterov=True,
+                )
             else:
                 tracker["outer_optimizer"] = None
+
+            # Compute global shard param count across TP and PP for consistent selection.
+            local_numel = sum(p.numel() for p in param_refs)
+            global_numel = self._all_reduce_scalar_sum(local_numel, group=tp_group)
+            global_numel = self._all_reduce_scalar_sum(global_numel, group=pp_group)
+            tracker["global_num_params"] = int(global_numel)
+
+            # Initialize global params to the cross-DC average (within this PP/TP partition).
+            # This is crucial: if global == local on every island, the first sync would have zero delta.
+            if len(tracker["params"]) > 0:
+                # Average the cloned tensors across CDC group in-place.
+                self._all_reduce_flattened([t.data for t in tracker["params"]])
 
             self.shard_tracker[shard_idx] = tracker
 
             if self.verbose:
-                 print_rank_0(f"[CDC] Shard {shard_idx} initialized with {len(shard_params_refs)} tensors.")
+                print_rank_0(
+                    f"[CDC] Shard {shard_idx} initialized: local_tensors={len(param_refs)}, "
+                    f"global_numel={tracker['global_num_params']}"
+                )
 
+    @staticmethod
+    def _tracker_has_any_params(tracker: Dict[str, Any]) -> bool:
+        return bool(tracker.get("param_refs")) or bool(tracker.get("params"))
+
+    @staticmethod
+    def _parse_layer_index(param_name: str) -> Optional[int]:
+        # Support common Megatron naming patterns:
+        # - "...layers.0...."
+        # - "...decoder.layers.0...."
+        m = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", param_name)
+        if m is None:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_embedding_param_name(param_name: str) -> bool:
+        # Input embedding-like params. Keep this broad but avoid matching decoder layers.
+        if '.layers.' in param_name:
+            return False
+        keys = (
+            'embedding',
+            'word_embeddings',
+            'position_embeddings',
+            'tok_embeddings',
+        )
+        return any(k in param_name for k in keys)
+
+    def _assign_param_to_shard(
+        self,
+        *,
+        name: str,
+        num_layers: int,
+        embedding_shards: int,
+        decoder_shards: int,
+    ) -> int:
+        # 1) Embeddings
+        if "output_layer" in name or "lm_head" in name:
+            # If embeddings/output are tied, treat output layer as the embedding shard.
+            # If untied, give output layer its own shard.
+            return 0 if self.tie_embeddings else 1
+
+        if self._is_embedding_param_name(name):
+            return 0
+
+        # 2) Decoder layers
+        layer_idx = self._parse_layer_index(name)
+        if layer_idx is not None and num_layers > 0 and decoder_shards > 0:
+            decoder_shard_idx = self._layer_to_decoder_shard(layer_idx, num_layers, decoder_shards)
+            return embedding_shards + decoder_shard_idx
+
+        # 3) Misc (final norm, output bias, etc.)
+        # Keep embeddings isolated: place misc into the last shard if possible.
+        return max(self.num_shards - 1, 0)
+
+    def _layer_to_decoder_shard(self, layer_idx: int, num_layers: int, decoder_shards: int) -> int:
+        if decoder_shards <= 0:
+            return 0
+        if self.shard_pattern == 'stride':
+            return layer_idx % decoder_shards
+
+        # sequential: contiguous balanced partition
+        base = num_layers // decoder_shards
+        rem = num_layers % decoder_shards
+        # First 'rem' shards get (base+1) layers
+        # Determine shard by walking boundaries.
+        boundary = 0
+        for s in range(decoder_shards):
+            size = base + (1 if s < rem else 0)
+            next_boundary = boundary + size
+            if boundary <= layer_idx < next_boundary:
+                return s
+            boundary = next_boundary
+        return decoder_shards - 1
+
+    @staticmethod
+    def _iter_named_trainable_params_unique(
+        model_chunks: List[MegatronModule],
+    ) -> List[Tuple[str, torch.nn.Parameter]]:
+        # named_parameters() already removes duplicates by default, but be extra safe across chunks.
+        results: List[Tuple[str, torch.nn.Parameter]] = []
+        seen_ids = set()
+        for chunk in model_chunks:
+            for name, p in chunk.named_parameters():
+                if not getattr(p, 'requires_grad', False):
+                    continue
+                pid = id(p)
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                results.append((name, p))
+        return results
+
+    def _all_reduce_scalar_sum(self, value: float, group) -> float:
+        if group is None:
+            return float(value)
+        try:
+            if dist.get_world_size(group=group) <= 1:
+                return float(value)
+        except Exception:
+            return float(value)
+
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        t = torch.tensor(float(value), device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
+        return float(t.item())
+
+    @torch.no_grad()
     def step(self):
         """
         Performs a single optimization step.
@@ -499,70 +600,47 @@ class CDCOptimizer(MegatronOptimizer):
                 start_time = time.time()
                 if self.algorithm == 'diloco':
                     self._sync_diloco()
-                elif self.algorithm == 'streaming':
+                elif self.algorithm in ['streaming', 'dc']:
                     self._sync_streaming()
-                elif self.algorithm == 'dc':
-                    self._sync_dc()
                 duration = time.time() - start_time
                 if self.verbose:
                     print_rank_0(f"[CDC] Step {self.step_count}: Outer sync completed in {duration:.4f}s.")
 
         return update_successful, grad_norm, num_zeros_in_grad
 
+    @torch.no_grad()
     def _sync_diloco(self):
-        """Standard DiLoCo synchronization."""        
-        param_groups = self.param_groups
-
+        """Standard DiLoCo synchronization."""
         # Calculate pseudo-gradients: G = Original - Current
-        for prev_group, curr_group in zip(self.original_snapshot, param_groups):
-            pseudo_grads = self._get_pseudo_grads(prev_group, curr_group['params'])
-            for p, g in zip(prev_group, pseudo_grads):
-                if p.grad is None:
-                    p.grad = torch.zeros_like(p.data)
-                p.grad.copy_(g) # 伪梯度赋值给 original_snapshot的grad
+        all_grads = []
+        for snap_param, model_param in zip(self.original_snapshot, self.model_param_list):
+            if snap_param.grad is None:
+                snap_param.grad = torch.zeros_like(snap_param.data)
+            snap_param.grad.copy_(snap_param.data - model_param.data)
+            all_grads.append(snap_param.grad)
 
         # Batch All-Reduce for efficiency
-        all_grads = []
-        for group in self.original_snapshot:
-            for p in group:
-                all_grads.append(p.grad)
         self._all_reduce_flattened(all_grads)
 
         # Outer Optimizer Step
         if self.outer_optimizer:
             self.outer_optimizer.step()
-            self.outer_optimizer.zero_grad()
+            self.outer_optimizer.zero_grad(set_to_none=True)
         else:
             # Simple averaging
-            for group in self.original_snapshot:
-                for p in group:
-                    p.data.sub_(p.grad)
-                    p.grad = None
+            for snap_param in self.original_snapshot:
+                snap_param.data.sub_(snap_param.grad)
+                snap_param.grad = None
 
         # Copy back to current model parameters
-        for updated_group, curr_group in zip(self.original_snapshot, param_groups):
-            for updated_param, curr_param in zip(updated_group, curr_group['params']):
-                if self.offload_outer_opt:
-                    curr_param.data.copy_(updated_param.data.to(curr_param.device))
-                else:
-                    curr_param.data.copy_(updated_param.data)
-        # Optimizer中main参数已经更新，半精度情况下可能会有外部前后向模型不同步的情况
+        for updated_param, curr_param in zip(self.original_snapshot, self.model_param_list):
+            curr_param.copy_(updated_param.to(curr_param.device))
+
+        # Keep optimizer main params in sync with model params for mixed precision.
         if self.mixed_precision:
-            self.optimizer._copy_main_params_to_model_params()  # fp16/bf16
-            
+            self.optimizer.reload_model_params()
+        
     def _sync_streaming(self):
-        """
-        Streaming DiLoCo synchronization.
-        """
-        self._sync()
-        
-    def _sync_dc(self):
-        """
-        Delay Compensated DiLoCo synchronization.
-        """
-        self._sync()
-        
-    def _sync(self):
         """Unified synchronization step for Streaming and DC."""
         # Check for pending receives
         for shard_idx, tracker in self.shard_tracker.items():
@@ -615,7 +693,8 @@ class CDCOptimizer(MegatronOptimizer):
             I_p = self.step_count - tracker["sent_at_step"]
             if I_p == 0: I_p = 1
 
-            current_R = update_magnitude_sq * 1e8 / (I_p * tracker["global_num_params"])
+            denom = tracker["global_num_params"] if tracker["global_num_params"] > 0 else 1
+            current_R = update_magnitude_sq * 1e8 / (I_p * denom)
             scores[shard_idx] = current_R
 
         # No global agreement needed (deterministic if all ranks have same history)
@@ -668,13 +747,9 @@ class CDCOptimizer(MegatronOptimizer):
         # 1. Calculate sync gradients (Global - Staged)
         sync_grads = []
         for p_global, p_staged in zip(global_params, staged_params):
-            if self.offload_outer_opt:
-                p_staged_dev = p_staged.to(p_global.device) if p_global.device.type != 'cpu' else p_staged
-            else:
-                p_staged_dev = p_staged
-
+            # Global and Staged 一定在同一个设备上
             g = p_global.data.clone()
-            g.sub_(p_staged_dev.data)
+            g.sub_(p_staged.data)
             sync_grads.append(g)
 
         # 2. All-Reduce sync_grads (Across DiLoCo Islands)
@@ -685,11 +760,18 @@ class CDCOptimizer(MegatronOptimizer):
         for g in sync_grads:
             total_norm_sq += g.norm(2).item() ** 2
 
-        # All-Reduce norm across TP group
+        # All-Reduce norm across TP group, then across PP group.
         tp_group = mpu.get_tensor_model_parallel_group()
         if tp_group is not None and dist.get_world_size(group=tp_group) > 1:
-            norm_tensor = torch.tensor(total_norm_sq, device=sync_grads[0].device)
+            norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
             dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=tp_group)
+            total_norm_sq = norm_tensor.item()
+
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        if pp_group is not None and dist.get_world_size(group=pp_group) > 1:
+            # Use GPU tensor if available (sync_grads may be empty on some partitions; handle that).
+            norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
+            dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=pp_group)
             total_norm_sq = norm_tensor.item()
 
         tracker["last_score"] = total_norm_sq
@@ -700,12 +782,12 @@ class CDCOptimizer(MegatronOptimizer):
 
         # 4. Outer Optimizer Step (Update Global)
         if tracker["outer_optimizer"]:
-            tracker["outer_optimizer"].zero_grad()
             for p_global, avg_delta in zip(global_params, sync_grads):
                 if p_global.grad is None:
                     p_global.grad = torch.zeros_like(p_global.data)
                 p_global.grad.copy_(avg_delta)
             tracker["outer_optimizer"].step()
+            tracker["outer_optimizer"].zero_grad(set_to_none=True)
         else:
             # Simple averaging
             for p_global, avg_delta in zip(global_params, sync_grads):
@@ -762,6 +844,11 @@ class CDCOptimizer(MegatronOptimizer):
 
                 p_local.data.mul_(self.streaming_alpha).add_(p_global_data, alpha=1.0 - self.streaming_alpha)
 
+        # Keep optimizer main params in sync with model params for mixed precision.
+        if self.mixed_precision:
+            self.optimizer.reload_model_params()
+
+    @torch.no_grad()
     def _all_reduce_flattened(self, tensors):
         """Helper to flatten, all-reduce, and unflatten tensors."""
         from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -787,11 +874,10 @@ class CDCOptimizer(MegatronOptimizer):
             # Move to GPU for NCCL if needed
             device = flat_tensor.device
             if self.offload_outer_opt and device.type == 'cpu':
-                # Use Gloo or move to GPU
-                # Assuming we have a GPU available
                 gpu_tensor = flat_tensor.cuda()
                 dist.all_reduce(gpu_tensor, group=self.cdc_group)
                 flat_tensor.copy_(gpu_tensor.cpu())
+                del gpu_tensor
             else:
                 dist.all_reduce(flat_tensor, group=self.cdc_group)
 
@@ -810,22 +896,11 @@ class CDCOptimizer(MegatronOptimizer):
             bandwidth = size_mb / duration if duration > 0 else 0
             print_rank_0(f"[CDC] Communication: {size_mb:.2f} MB in {duration:.4f}s ({bandwidth:.2f} MB/s)")
 
-    def _get_pseudo_grads(self, prev, curr):
-        """Compute pseudo-gradients as prev - curr. Both are lists of Parameters."""
-        pseudo_grads = []
-        for p_prev, p_curr in zip(prev, curr):
-            g = p_prev.data.clone().detach()
-            if self.offload_outer_opt:
-                p = p_curr.data.detach().to("cpu", copy=True)
-            else:
-                p = p_curr.data.detach()
-            g.sub_(p).require_grad_(False)
-            pseudo_grads.append(g)
-        return pseudo_grads
-    
+    @torch.no_grad()
     def prepare_grads(self):
         return self.inner_optimizer.prepare_grads()
 
+    @torch.no_grad()
     def step_with_ready_grads(self):
         return self.inner_optimizer.step_with_ready_grads()
 
