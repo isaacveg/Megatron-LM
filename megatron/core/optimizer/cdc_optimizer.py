@@ -283,6 +283,12 @@ class CDCOptimizer(MegatronOptimizer):
             outer_state = shard_state.get("outer_optimizer")
             if tracker.get("outer_optimizer") is not None and outer_state is not None:
                 tracker["outer_optimizer"].load_state_dict(outer_state)
+                device = (
+                    tracker["params"][0].device
+                    if tracker.get("params") and len(tracker["params"]) > 0
+                    else torch.device("cpu")
+                )
+                self._move_optimizer_state_to_device(tracker["outer_optimizer"], device)
 
     def _copy_tensor_list(self, target_list, saved_list):
         if len(target_list) != len(saved_list):
@@ -297,6 +303,26 @@ class CDCOptimizer(MegatronOptimizer):
             target_tensor.copy_(
                 saved_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
             )
+
+    @staticmethod
+    def _clone_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        """Detach and clone a tensor to CPU for checkpointing."""
+        if tensor is None:
+            return None
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"Expected a torch.Tensor, got {type(tensor)}")
+        with torch.no_grad():
+            return tensor.detach().to(device="cpu").clone()
+
+    @staticmethod
+    def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+        """Move optimizer state tensors to the given device (for restoring CPU-saved state)."""
+        if optimizer is None:
+            return
+        for state in optimizer.state.values():
+            for key, value in list(state.items()):
+                if torch.is_tensor(value):
+                    state[key] = value.to(device=device)
 
     def _init_diloco_state(self):
         """Initialize state for standard DiLoCo."""
@@ -588,23 +614,29 @@ class CDCOptimizer(MegatronOptimizer):
         """
         Performs a single optimization step.
         1. Inner step (Megatron).
-        2. Outer step (DiLoCo sync) if interval is met.
+        2. Outer step:
+           - DiLoCo: sync every sync_interval steps.
+           - Streaming/DC: check pending receives every step and initiate sync every sync_interval steps.
         """
         # 1. Inner Step
         update_successful, grad_norm, num_zeros_in_grad = self.inner_optimizer.step()
 
         if update_successful:
             self.step_count += 1
+
             # 2. Outer Step
-            if self.step_count % self.sync_interval == 0:
-                start_time = time.time()
-                if self.algorithm == 'diloco':
+            if self.algorithm == 'diloco':
+                if self.step_count % self.sync_interval == 0:
+                    start_time = time.time()
                     self._sync_diloco()
-                elif self.algorithm in ['streaming', 'dc']:
-                    self._sync_streaming()
-                duration = time.time() - start_time
-                if self.verbose:
-                    print_rank_0(f"[CDC] Step {self.step_count}: Outer sync completed in {duration:.4f}s.")
+                    duration = time.time() - start_time
+                    if self.verbose:
+                        print_rank_0(
+                            f"[CDC] Step {self.step_count}: Outer sync completed in {duration:.4f}s."
+                        )
+            elif self.algorithm in ['streaming', 'dc']:
+                # Always check pending receives to respect per-step delay semantics.
+                self._sync_streaming()
 
         return update_successful, grad_norm, num_zeros_in_grad
 
@@ -616,7 +648,10 @@ class CDCOptimizer(MegatronOptimizer):
         for snap_param, model_param in zip(self.original_snapshot, self.model_param_list):
             if snap_param.grad is None:
                 snap_param.grad = torch.zeros_like(snap_param.data)
-            snap_param.grad.copy_(snap_param.data - model_param.data)
+            model_data = model_param.data
+            if model_data.device != snap_param.device or model_data.dtype != snap_param.dtype:
+                model_data = model_data.to(device=snap_param.device, dtype=snap_param.dtype)
+            snap_param.grad.copy_(snap_param.data - model_data)
             all_grads.append(snap_param.grad)
 
         # Batch All-Reduce for efficiency
@@ -638,7 +673,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         # Keep optimizer main params in sync with model params for mixed precision.
         if self.mixed_precision:
-            self.optimizer.reload_model_params()
+            self.inner_optimizer.reload_model_params()
         
     def _sync_streaming(self):
         """Unified synchronization step for Streaming and DC."""
@@ -847,7 +882,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         # Keep optimizer main params in sync with model params for mixed precision.
         if self.mixed_precision:
-            self.optimizer.reload_model_params()
+            self.inner_optimizer.reload_model_params()
 
     @torch.no_grad()
     def _all_reduce_flattened(self, tensors):
