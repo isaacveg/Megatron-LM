@@ -2708,8 +2708,18 @@ def _add_cdc_args(parser):
     # DC-DiLoCo specific
     group.add_argument('--cdc-dc-N', type=int, default=4,
                        help='Expected maximum number of transmissions within one sync_interval for DC-DiLoCo.')
-    group.add_argument('--cdc-dc-lambda', type=float, default=2.0,
-                       help='Lambda coefficient for DC-DiLoCo delay compensation.')
+    group.add_argument('--cdc-dc-lambda', type=float, default=0.1,
+                       help='Base lambda coefficient for DC-DiLoCo delay compensation.')
+    group.add_argument('--cdc-dc-lambda-max', type=float, default=10.0,
+                       help='Max lambda clamp for DC-DiLoCo delay compensation (update-space formulation).')
+    group.add_argument('--cdc-dc-lambda-scope', type=str, default='shard',
+                       choices=['shard', 'tensor', 'local'],
+                       help='Lambda reduction scope for DC-DiLoCo delay compensation.')
+    group.add_argument('--cdc-dc-debias-wd', action='store_true',
+                       help='Enable decoupled weight decay debiasing in delay compensation.')
+    group.add_argument('--cdc-dc-type', type=str, default='update',
+                       choices=['update', 'legacy'],
+                       help='Delay compensation formulation for DC-DiLoCo.')
     group.add_argument('--cdc-delay', type=int, default=0,
                        help='Simulated communication delay (in steps) for Streaming-based methods.')
     group.add_argument('--cdc-streaming-alpha', type=float, default=0.5,

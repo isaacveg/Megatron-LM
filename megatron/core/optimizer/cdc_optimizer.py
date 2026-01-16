@@ -7,6 +7,7 @@ from copy import deepcopy
 from typing import List, Dict, Any, Optional, Tuple
 import time
 import re
+import math
 
 from megatron.core import mpu
 from megatron.training.utils import print_rank_0
@@ -50,8 +51,17 @@ class CDCOptimizer(MegatronOptimizer):
         self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'stride')
         self.verbose = getattr(args, 'cdc_verbose', False)
         self.mixed_precision = getattr(args, 'bf16', False) or getattr(args, 'fp16', False)
+        # DC specifics.
+        self.dc_type = str(getattr(args, "cdc_dc_type", "update")).lower()
         # Initialized for all algorithms so checkpoint/state construction does not fail.
         self.next_shard_idx = 0
+
+        # Track per-param-group LR/WD history for DC debiasing.
+        self._optimizer_param_id_to_group_idx: Dict[int, int] = {}
+        self._lr_cumsums_by_group: Optional[List[float]] = None
+        self._wd_log_cumsums_by_group: Optional[List[float]] = None
+        self._init_lr_wd_tracking()
+        self._build_optimizer_param_group_index()
 
         if self.verbose:
             print_rank_0(f"[CDC] Initialized {self.algorithm} optimizer. Sync interval: {self.sync_interval}, Shards: {self.num_shards}")
@@ -62,6 +72,111 @@ class CDCOptimizer(MegatronOptimizer):
             self._init_streaming_state()
         else:
             raise ValueError(f"Unknown DiLoCo algorithm: {self.algorithm}")
+
+    # ------------------------------------------------------------------
+    # LR/WD tracking (for DC weight-decay debias)
+    # ------------------------------------------------------------------
+
+    def _build_optimizer_param_group_index(self) -> None:
+        """Build mapping from optimizer (main) param id to param_group index."""
+        mapping: Dict[int, int] = {}
+        for group_idx, group in enumerate(self.param_groups):
+            for p in group.get("params", []):
+                mapping[id(p)] = group_idx
+        self._optimizer_param_id_to_group_idx = mapping
+
+    def _get_param_group_index_for_model_param(self, param: torch.nn.Parameter) -> Optional[int]:
+        """Return the param_group index for a model param (handles fp16 main params)."""
+        if param is None:
+            return None
+        main_param = getattr(param, "main_param", param)
+        return self._optimizer_param_id_to_group_idx.get(id(main_param))
+
+    def _init_lr_wd_tracking(self) -> None:
+        """Initialize cumulative LR and log(weight-decay factors) per param group."""
+        num_groups = len(self.param_groups)
+        self._lr_cumsums_by_group = [0.0 for _ in range(num_groups)]
+        self._wd_log_cumsums_by_group = [0.0 for _ in range(num_groups)]
+
+    def _ensure_lr_wd_tracking(self) -> None:
+        if self._lr_cumsums_by_group is None or self._wd_log_cumsums_by_group is None:
+            self._init_lr_wd_tracking()
+            return
+
+    def _record_lr_wd_for_step(self) -> None:
+        """Record LR/WD of the just-applied inner step into cumulative trackers."""
+        self._ensure_lr_wd_tracking()
+        assert self._lr_cumsums_by_group is not None
+        assert self._wd_log_cumsums_by_group is not None
+
+        for group_idx, group in enumerate(self.param_groups):
+            lr = float(group.get("lr", 0.0))
+            wd = float(group.get("weight_decay", 0.0))
+
+            self._lr_cumsums_by_group[group_idx] += lr
+
+            # For AdamW-style decoupled weight decay, the per-step multiplicative factor is:
+            #   rho_step = (1 - lr * wd)
+            # We accumulate log(rho_step) to later get products over intervals.
+            if lr == 0.0 or wd == 0.0:
+                continue
+            x = lr * wd
+            if x >= 1.0:
+                # Pathological; treat as zeroing the parameter.
+                self._wd_log_cumsums_by_group[group_idx] = float("-inf")
+                continue
+            self._wd_log_cumsums_by_group[group_idx] += math.log1p(-x)
+
+    def _snapshot_sent_wd_log_cumsums(self, tracker: Dict[str, Any]) -> Dict[int, float]:
+        """Snapshot per-group cumulative log(weight-decay factors) at send time."""
+        self._ensure_lr_wd_tracking()
+        assert self._wd_log_cumsums_by_group is not None
+
+        sent: Dict[int, float] = {}
+        for group_idx in tracker.get("unique_param_group_indices", []):
+            if group_idx is None:
+                continue
+            if group_idx < 0 or group_idx >= len(self._wd_log_cumsums_by_group):
+                continue
+            sent[int(group_idx)] = float(self._wd_log_cumsums_by_group[group_idx])
+        return sent
+
+    def _rho_wd_between_send_and_now(self, tracker: Dict[str, Any], group_idx: Optional[int]) -> float:
+        """Compute weight-decay-only multiplicative factor rho over (sent_at_step, current_step]."""
+        if group_idx is None:
+            return 1.0
+        self._ensure_lr_wd_tracking()
+        assert self._wd_log_cumsums_by_group is not None
+
+        # 越界检查
+        if group_idx < 0 or group_idx >= len(self._wd_log_cumsums_by_group):
+            return 1.0
+
+        # 发送的时候的wd log累积值
+        sent_logs = tracker.get("sent_wd_log_cumsums")
+        if not isinstance(sent_logs, dict):
+            return 1.0
+        sent_log = sent_logs.get(int(group_idx))
+        if sent_log is None:
+            return 1.0
+
+        # 当前的wd log累积值
+        current_log = float(self._wd_log_cumsums_by_group[group_idx])
+        sent_log = float(sent_log)
+
+        if math.isinf(current_log) and current_log < 0:
+            if math.isinf(sent_log) and sent_log < 0:
+                return 1.0
+            return 0.0
+        if math.isinf(sent_log) and sent_log < 0:
+            return 0.0
+
+        # 计算 rho = exp(current_log - sent_log)
+        log_rho = current_log - sent_log
+        # Avoid underflow in exp for very negative values.
+        rho = 0.0 if log_rho < -745.0 else math.exp(log_rho)
+        # Clamp to [0, 1] to avoid numerical drift.
+        return float(max(0.0, min(1.0, rho)))
 
     @property
     def is_stub_optimizer(self):
@@ -145,11 +260,19 @@ class CDCOptimizer(MegatronOptimizer):
             "outer_optimizer": outer_state,
         }
 
+    def _serialize_lr_wd_tracking(self) -> Dict[str, Any]:
+        self._ensure_lr_wd_tracking()
+        return {
+            "lr_cumsums_by_group": deepcopy(self._lr_cumsums_by_group),
+            "wd_log_cumsums_by_group": deepcopy(self._wd_log_cumsums_by_group),
+        }
+
     def _build_cdc_state(self):
         state = {
             "algorithm": self.algorithm,
             "step_count": self.step_count,
             "next_shard_idx": self.next_shard_idx,
+            "lr_wd_tracking": self._serialize_lr_wd_tracking(),
         }
 
         if self.algorithm == 'diloco' and getattr(self, "original_snapshot", None) is not None:
@@ -178,6 +301,7 @@ class CDCOptimizer(MegatronOptimizer):
                 "sent_at_step": int(tracker["sent_at_step"]),
                 "old_sent_at_step": int(tracker["old_sent_at_step"]),
                 "next_receive_step": int(tracker["next_receive_step"]),
+                "sent_wd_log_cumsums": deepcopy(tracker.get("sent_wd_log_cumsums")) if save_staged else None,
                 "global_num_params": int(tracker["global_num_params"]),
                 "last_score": float(tracker["last_score"]),
             }
@@ -229,6 +353,16 @@ class CDCOptimizer(MegatronOptimizer):
         self.step_count = cdc_state.get("step_count", self.step_count)
         self.next_shard_idx = cdc_state.get("next_shard_idx", self.next_shard_idx)
 
+        # Restore LR/WD tracking (best-effort; older checkpoints may not have it).
+        tracking = cdc_state.get("lr_wd_tracking")
+        if isinstance(tracking, dict):
+            lr_cumsums = tracking.get("lr_cumsums_by_group")
+            wd_log_cumsums = tracking.get("wd_log_cumsums_by_group")
+            if isinstance(lr_cumsums, list) and isinstance(wd_log_cumsums, list):
+                self._lr_cumsums_by_group = [float(x) for x in lr_cumsums]
+                self._wd_log_cumsums_by_group = [float(x) for x in wd_log_cumsums]
+        self._ensure_lr_wd_tracking()
+
         if self.algorithm == 'diloco':
             self._load_diloco_state(cdc_state.get("diloco"))
         elif self.algorithm in ['streaming', 'dc']:
@@ -277,6 +411,9 @@ class CDCOptimizer(MegatronOptimizer):
             tracker["sent_at_step"] = shard_state.get("sent_at_step", tracker["sent_at_step"])
             tracker["old_sent_at_step"] = shard_state.get("old_sent_at_step", tracker["old_sent_at_step"])
             tracker["next_receive_step"] = shard_state.get("next_receive_step", tracker["next_receive_step"])
+            tracker["sent_wd_log_cumsums"] = shard_state.get(
+                "sent_wd_log_cumsums", tracker.get("sent_wd_log_cumsums")
+            )
             tracker["global_num_params"] = shard_state.get("global_num_params", tracker["global_num_params"])
             tracker["last_score"] = shard_state.get("last_score", tracker["last_score"])
 
@@ -447,8 +584,19 @@ class CDCOptimizer(MegatronOptimizer):
         for shard_idx in range(self.num_shards):
             param_refs = shard_to_param_refs.get(shard_idx, [])
 
+            param_group_indices = [
+                self._get_param_group_index_for_model_param(p) for p in param_refs
+            ]
+            unique_param_group_indices = sorted(
+                {i for i in param_group_indices if i is not None}
+            )
+
             tracker = {
                 "param_refs": param_refs,
+                "param_group_indices": param_group_indices,
+                "unique_param_group_indices": unique_param_group_indices,
+                # Populated at send time to enable accurate WD debias even with lr-warmup-fraction.
+                "sent_wd_log_cumsums": None,
                 "params": [],
                 "staged_params": [],
                 "sent_at_step": 0,
@@ -623,6 +771,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         if update_successful:
             self.step_count += 1
+            self._record_lr_wd_for_step()
 
             # 2. Outer Step
             if self.algorithm == 'diloco':
@@ -722,14 +871,18 @@ class CDCOptimizer(MegatronOptimizer):
             # Use cached score from last sync
             # R = ||grad||^2 * 1e8 / (I_p * N_params)
             # Note: tracker['last_score'] stores ||grad||^2 (aggregated across TP)
-
             update_magnitude_sq = tracker["last_score"]
 
-            I_p = self.step_count - tracker["sent_at_step"]
-            if I_p == 0: I_p = 1
+            I_p = max(self.step_count - tracker["sent_at_step"], 1)
+            
+            last_sync_interval = max(tracker["sent_at_step"] - tracker["old_sent_at_step"], 1)
 
             denom = tracker["global_num_params"] if tracker["global_num_params"] > 0 else 1
-            current_R = update_magnitude_sq * 1e8 / (I_p * denom)
+            # current_R = update_magnitude_sq * 1e8 / (I_p * denom)
+            # 分数逻辑：norm * I_p / last_sync_interval / N_params，1e8放大数值防止下溢
+            # current_R = 1e8 * (update_magnitude_sq * I_p) / ( last_sync_interval * denom )
+            # 改用RMS
+            current_R = 1e8 * (math.sqrt(update_magnitude_sq/denom)) * (I_p / last_sync_interval)
             scores[shard_idx] = current_R
 
         # No global agreement needed (deterministic if all ranks have same history)
@@ -763,6 +916,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         tracker["old_sent_at_step"] = tracker["sent_at_step"]
         tracker["sent_at_step"] = self.step_count
+        tracker["sent_wd_log_cumsums"] = self._snapshot_sent_wd_log_cumsums(tracker)
 
         # Schedule receive
         tracker["next_receive_step"] = self.step_count + self.delay
@@ -831,7 +985,30 @@ class CDCOptimizer(MegatronOptimizer):
 
         # 5. Update Local Params (Algorithm Specific)
         if self.algorithm == 'dc':
-            # Delay Compensation (Taylor Expansion)
+            self.delay_compensation(tracker)
+
+        elif self.algorithm == 'streaming':
+            # Alpha Blending
+            for p_local, p_global in zip(param_refs, global_params):
+                if self.offload_outer_opt:
+                    p_global_data = p_global.data.to(p_local.device)
+                else:
+                    p_global_data = p_global.data
+
+                p_local.data.mul_(self.streaming_alpha).add_(p_global_data, alpha=1.0 - self.streaming_alpha)
+
+        # Keep optimizer main params in sync with model params for mixed precision.
+        if self.mixed_precision:
+            self.inner_optimizer.reload_model_params()
+            
+    def delay_compensation(self, tracker):
+        """ Update Local Params (Algorithm Specific)"""
+        staged_params = tracker["staged_params"]
+        param_refs = tracker["param_refs"]
+        global_params = tracker["params"]
+
+        # 老版
+        if self.dc_type == "legacy":
             g_1 = []
             D = []
 
@@ -869,21 +1046,149 @@ class CDCOptimizer(MegatronOptimizer):
                     p_local.data.copy_(target.to(p_local.device))
                 else:
                     p_local.data.copy_(p_global.data - g_corr)
+            return
+        
+        # 新版本
+        # ---- Update-space delay compensation ----
+        # Effective staleness in inner steps (may be > self.delay if scheduling shifts)
+        tau = int(self.step_count - tracker["sent_at_step"])
+        tau = max(tau, 1)
+        param_group_indices = tracker["param_group_indices"]
 
-        elif self.algorithm == 'streaming':
-            # Alpha Blending
-            for p_local, p_global in zip(param_refs, global_params):
-                if self.offload_outer_opt:
-                    p_global_data = p_global.data.to(p_local.device)
-                else:
-                    p_global_data = p_global.data
+        eps = 1e-8  # 数值稳定性
+        args = get_args()
+        lam0 = self.dc_lambda  # lambda base
+        lam_max = float(getattr(args, "cdc_dc_lambda_max", 10.0))  # 上限
+        scope = str(getattr(args, "cdc_dc_lambda_scope", "shard")).lower()  # "shard", "tensor", "local"
+        debias_wd = bool(getattr(args, "cdc_dc_debias_wd", False))
 
-                p_local.data.mul_(self.streaming_alpha).add_(p_global_data, alpha=1.0 - self.streaming_alpha)
+        # Per-param-group rho for decoupled weight decay debias (optional).
+        rho_by_group: Dict[int, float] = {}
+        if debias_wd:
+            for group_idx in tracker.get("unique_param_group_indices", []):
+                rho_by_group[int(group_idx)] = self._rho_wd_between_send_and_now(
+                    tracker, int(group_idx)
+                )
 
-        # Keep optimizer main params in sync with model params for mixed precision.
-        if self.mixed_precision:
-            self.inner_optimizer.reload_model_params()
+        tp_group = mpu.get_tensor_model_parallel_group()
+        pp_group = mpu.get_pipeline_model_parallel_group()
 
+        def _reduce_sum(x: float, do_tp: bool, do_pp: bool) -> float:
+            y = float(x)
+            if do_tp:
+                y = self._all_reduce_scalar_sum(y, group=tp_group)
+            if do_pp:
+                y = self._all_reduce_scalar_sum(y, group=pp_group)
+            return float(y)
+
+        # Decide reduction policy
+        if scope == "shard":
+            do_tp, do_pp = True, True
+        elif scope == "tensor":
+            do_tp, do_pp = True, False
+        elif scope == "local":
+            do_tp, do_pp = False, False
+        else:
+            raise ValueError(f"Unknown cdc_dc_lambda_scope: {scope}")
+
+        # Helper: compute sum of squares in fp32 (device-agnostic)
+        def _sqsum_fp32(t: torch.Tensor) -> float:
+            return float(t.float().pow(2).sum().item())
+
+        def _dc_terms(
+            p_staged: torch.Tensor,
+            p_local: torch.nn.Parameter,
+            p_global: torch.Tensor,
+            rho: float,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Compute (u, c, z_wd) in fp32 for update-space delay compensation."""
+            if self.offload_outer_opt:
+                theta1 = p_local.detach().to("cpu")
+                z = p_global.data
+            else:
+                theta1 = p_local.data
+                z = p_global.data
+
+            theta0 = p_staged.data
+            z_wd = z.mul(rho) if debias_wd else z
+            D = (z_wd - theta0).to(torch.float32)
+
+            u_total = (theta0 - theta1).to(torch.float32).div(tau)
+            if debias_wd and rho != 1.0:
+                u_wd = theta0.to(torch.float32).mul((1.0 - rho) / tau)
+                u = u_total - u_wd
+            else:
+                u = u_total
+
+            c = (u * u) * D
+            return u, c, z_wd
+
+        # -------------------------
+        # Case A: per-shard lambda
+        # -------------------------
+        if scope in ("shard", "local"):
+            # Pass 1: accumulate local shard norms (no extra tensor storage)
+            local_u2 = 0.0
+            local_c2 = 0.0
+
+            for p_staged, p_local, p_global, group_idx in zip(
+                staged_params, param_refs, global_params, param_group_indices
+            ):
+                rho = rho_by_group.get(int(group_idx), 1.0) if group_idx is not None else 1.0
+                u, c, _ = _dc_terms(p_staged, p_local, p_global, rho)
+                local_u2 += _sqsum_fp32(u)
+                local_c2 += _sqsum_fp32(c)
+
+            # Reduce norms if requested
+            u2 = _reduce_sum(local_u2, do_tp=do_tp, do_pp=do_pp)
+            c2 = _reduce_sum(local_c2, do_tp=do_tp, do_pp=do_pp)
+
+            norm_u = math.sqrt(max(u2, 0.0))
+            norm_c = math.sqrt(max(c2, 0.0))
+
+            lam = lam0 * norm_u / (norm_c + eps)
+            lam = float(min(lam, lam_max))
+
+            # Pass 2: apply compensated update
+            for p_staged, p_local, p_global, group_idx in zip(
+                staged_params, param_refs, global_params, param_group_indices
+            ):
+                rho = rho_by_group.get(int(group_idx), 1.0) if group_idx is not None else 1.0
+                u, c, z_wd = _dc_terms(p_staged, p_local, p_global, rho)
+                u_hat = u + lam * c
+
+                target = z_wd.to(torch.float32) - (tau * u_hat)
+
+                p_local.data.copy_(target.to(dtype=p_local.dtype, device=p_local.device))
+
+        # -------------------------
+        # Case B: per-tensor lambda
+        # -------------------------
+        else:  # scope == "tensor"
+            for p_staged, p_local, p_global, group_idx in zip(
+                staged_params, param_refs, global_params, param_group_indices
+            ):
+                rho = rho_by_group.get(int(group_idx), 1.0) if group_idx is not None else 1.0
+                u, c, z_wd = _dc_terms(p_staged, p_local, p_global, rho)
+
+                # compute per-tensor norms and reduce across TP only
+                local_u2 = _sqsum_fp32(u)
+                local_c2 = _sqsum_fp32(c)
+
+                u2 = _reduce_sum(local_u2, do_tp=True, do_pp=False)
+                c2 = _reduce_sum(local_c2, do_tp=True, do_pp=False)
+
+                norm_u = math.sqrt(max(u2, 0.0))
+                norm_c = math.sqrt(max(c2, 0.0))
+
+                lam = lam0 * norm_u / (norm_c + eps)
+                lam = float(min(lam, lam_max))
+
+                u_hat = u + lam * c
+                target = z_wd.to(torch.float32) - (tau * u_hat)
+
+                p_local.data.copy_(target.to(dtype=p_local.dtype, device=p_local.device))
+    
     @torch.no_grad()
     def _all_reduce_flattened(self, tensors):
         """Helper to flatten, all-reduce, and unflatten tensors."""
@@ -936,7 +1241,7 @@ class CDCOptimizer(MegatronOptimizer):
             size_mb = total_bytes / (1024 * 1024)
             bandwidth = size_mb / duration if duration > 0 else 0
             print_rank_0(f"[CDC] Communication: {size_mb:.2f} MB in {duration:.4f}s ({bandwidth:.2f} MB/s)")
-
+    
     @torch.no_grad()
     def prepare_grads(self):
         return self.inner_optimizer.prepare_grads()
