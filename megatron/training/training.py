@@ -1979,9 +1979,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             iteration += 1
-            batch_size = mpu.get_data_parallel_world_size() * \
-                         args.micro_batch_size * \
-                         get_num_microbatches()
+            # CHANGE: Use current running global batch size for CDC compatible logging
+            batch_size = get_current_running_global_batch_size()
+            # batch_size = mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
             continue
@@ -2024,9 +2024,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     pre_hook_enabled = True
 
         iteration += 1
-        batch_size = mpu.get_data_parallel_world_size() * \
-                     args.micro_batch_size * \
-                     get_num_microbatches()
+        batch_size = get_current_running_global_batch_size()
+        # CHANGE: Use current running global batch size for CDC compatible logging
+        # batch_size = mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         args.consumed_train_samples += batch_size
         num_skipped_samples_in_batch = (get_current_global_batch_size() -
                                         get_current_running_global_batch_size())

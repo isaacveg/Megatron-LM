@@ -847,6 +847,9 @@ def validate_args(args, defaults={}):
     if args.context_parallel_size > 1:
         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
 
+    if args.cdc_parallel_size > 1:
+        assert args.use_cdc, "--cdc-parallel-size > 1 requires --use-cdc."
+
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"

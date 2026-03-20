@@ -51,10 +51,19 @@ class CDCOptimizer(MegatronOptimizer):
         self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'stride')
         self.verbose = getattr(args, 'cdc_verbose', False)
         self.mixed_precision = getattr(args, 'bf16', False) or getattr(args, 'fp16', False)
+        model_params = self.model_param_list
+        self.model_param_dtype = model_params[0].dtype if model_params else torch.float32
+        # Follow Streaming DiLoCo: keep outer-state math in fp32, but keep communication low
+        # precision by default to avoid doubling bandwidth.
+        self.outer_state_dtype = torch.float32 if self.mixed_precision else self.model_param_dtype
+        self.outer_comm_dtype = (
+            self.model_param_dtype if self.mixed_precision else self.outer_state_dtype
+        )
         # DC specifics.
         self.dc_type = str(getattr(args, "cdc_dc_type", "update")).lower()
         # Initialized for all algorithms so checkpoint/state construction does not fail.
         self.next_shard_idx = 0
+        self._cdc_state_loaded = False
 
         # Track per-param-group LR/WD history for DC debiasing.
         self._optimizer_param_id_to_group_idx: Dict[int, int] = {}
@@ -64,7 +73,11 @@ class CDCOptimizer(MegatronOptimizer):
         self._build_optimizer_param_group_index()
 
         if self.verbose:
-            print_rank_0(f"[CDC] Initialized {self.algorithm} optimizer. Sync interval: {self.sync_interval}, Shards: {self.num_shards}")
+            print_rank_0(
+                f"[CDC] Initialized {self.algorithm} optimizer. Sync interval: "
+                f"{self.sync_interval}, Shards: {self.num_shards}, "
+                f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}"
+            )
         
         if self.algorithm == 'diloco':
             self._init_diloco_state()
@@ -185,6 +198,14 @@ class CDCOptimizer(MegatronOptimizer):
     @property
     def optimizer(self):
         return self.inner_optimizer.optimizer
+
+    @property
+    def state(self):
+        return self.inner_optimizer.state
+
+    @state.setter
+    def state(self, value):
+        self.inner_optimizer.state = value
     
     @property
     def main_param_list(self):
@@ -206,8 +227,28 @@ class CDCOptimizer(MegatronOptimizer):
     def get_loss_scale(self):
         return self.inner_optimizer.get_loss_scale()
 
+    def get_parameters(self):
+        return self.inner_optimizer.get_parameters()
+
+    def get_grad_stats_parallel_group(self):
+        return self.inner_optimizer.get_grad_stats_parallel_group()
+
+    @torch.no_grad()
+    def get_grad_norm(self):
+        return self.inner_optimizer.get_grad_norm()
+
+    def clip_grad_norm(self, clip_grad: float):
+        return self.inner_optimizer.clip_grad_norm(clip_grad)
+
+    def count_zeros(self):
+        return self.inner_optimizer.count_zeros()
+
     def reload_model_params(self):
         self.inner_optimizer.reload_model_params()
+        # When a model checkpoint is loaded without CDC state, Megatron only asks the optimizer to
+        # refresh its inner fp32 main params. Keep CDC outer state aligned with the loaded model.
+        if self.step_count == 0 and not self._cdc_state_loaded:
+            self._reset_outer_state_from_model()
 
     def state_dict(self, is_loading: bool = False):
         """Return optimizer state plus CDC metadata."""
@@ -219,13 +260,24 @@ class CDCOptimizer(MegatronOptimizer):
     def load_state_dict(self, state_dict):
         """Load optimizer state including CDC metadata (compatible with normal checkpoint)."""
         if "inner_optimizer" not in state_dict: # Normal checkpoint without CDC metadata
+            self._cdc_state_loaded = False
             self.inner_optimizer.load_state_dict(state_dict)
+            self._reset_outer_state_from_model()
         else:   # CDC checkpoint
             self.inner_optimizer.load_state_dict(state_dict["inner_optimizer"])
             self._load_cdc_state(state_dict.get("cdc_state"))
+            self._cdc_state_loaded = True
 
     def zero_grad(self, set_to_none=True):
         self.inner_optimizer.zero_grad(set_to_none)
+
+    def save_parameter_state(self, filename: str):
+        self.inner_optimizer.save_parameter_state(filename)
+
+    def load_parameter_state(self, filename: str, *, update_legacy_format: bool = False):
+        self.inner_optimizer.load_parameter_state(
+            filename, update_legacy_format=update_legacy_format
+        )
 
     @property
     def param_groups(self):
@@ -252,8 +304,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         outer_state = None
         if self.outer_optimizer is not None:
-            outer_state = self.outer_optimizer.state_dict()
-            # outer_state = self._optimizer_state_to_cpu(self.outer_optimizer.state_dict())
+            outer_state = self._optimizer_state_to_cpu(self.outer_optimizer.state_dict())
 
         return {
             "original_snapshot": snapshot,
@@ -384,6 +435,12 @@ class CDCOptimizer(MegatronOptimizer):
 
         if self.outer_optimizer is not None:
             self.outer_optimizer.load_state_dict(diloco_state["outer_optimizer"])
+            device = (
+                self.original_snapshot[0].device
+                if getattr(self, "original_snapshot", None)
+                else torch.device("cpu")
+            )
+            self._move_optimizer_state_to_device(self.outer_optimizer, device)
 
     def _load_shard_trackers(self, shard_states):
         if not shard_states:
@@ -461,16 +518,58 @@ class CDCOptimizer(MegatronOptimizer):
                 if torch.is_tensor(value):
                     state[key] = value.to(device=device)
 
+    def _clone_param_for_outer_state(self, param: torch.nn.Parameter) -> torch.Tensor:
+        target_device = torch.device("cpu") if self.offload_outer_opt else param.device
+        return param.detach().to(
+            device=target_device, dtype=self.outer_state_dtype, copy=True
+        )
+
+    def _reset_outer_state_from_model(self) -> None:
+        """Reinitialize CDC outer state from the current model parameters."""
+        self.step_count = 0
+        self.next_shard_idx = 0
+        self._init_lr_wd_tracking()
+
+        if self.algorithm == 'diloco' and getattr(self, "original_snapshot", None) is not None:
+            for target, local in zip(self.original_snapshot, self.model_param_list):
+                self._copy_tensor_data(target, local.data)
+            if self.original_snapshot:
+                self._all_reduce_flattened(
+                    self.original_snapshot, communication_dtype=self.outer_comm_dtype
+                )
+            if self.outer_optimizer is not None:
+                self.outer_optimizer.state.clear()
+            return
+
+        if self.algorithm not in ['streaming', 'dc'] or getattr(self, "shard_tracker", None) is None:
+            return
+
+        for tracker in self.shard_tracker.values():
+            for p_global, p_local in zip(tracker["params"], tracker["param_refs"]):
+                self._copy_tensor_data(p_global, p_local.data)
+            for p_staged, p_local in zip(tracker["staged_params"], tracker["param_refs"]):
+                self._copy_tensor_data(p_staged, p_local.data)
+
+            tracker["sent_wd_log_cumsums"] = None
+            tracker["sent_at_step"] = 0
+            tracker["old_sent_at_step"] = 0
+            tracker["next_receive_step"] = 0
+            tracker["last_score"] = 0.0
+
+            if tracker["outer_optimizer"] is not None:
+                tracker["outer_optimizer"].state.clear()
+
+            if tracker["params"]:
+                self._all_reduce_flattened(
+                    [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
+                )
+
     def _init_diloco_state(self):
         """Initialize state for standard DiLoCo."""
         self.original_snapshot = []  # 上一次同步时的模型参数快照（展平列表）
 
         for param in self.model_param_list:
-            if self.offload_outer_opt:
-                cloned = param.detach().to("cpu", copy=True)
-            else:
-                cloned = param.detach().clone()
-            self.original_snapshot.append(cloned.requires_grad_(True))
+            self.original_snapshot.append(self._clone_param_for_outer_state(param).requires_grad_(True))
 
         # Initialize outer optimizer (Nesterov SGD)
         if self.outer_lr != 1.0:
@@ -608,12 +707,8 @@ class CDCOptimizer(MegatronOptimizer):
 
             # Clone for global / staged buffers.
             for p in param_refs:
-                if self.offload_outer_opt:
-                    tracker["params"].append(p.detach().to("cpu", copy=True))
-                    tracker["staged_params"].append(p.detach().to("cpu", copy=True))
-                else:
-                    tracker["params"].append(p.detach().clone())
-                    tracker["staged_params"].append(p.detach().clone())
+                tracker["params"].append(self._clone_param_for_outer_state(p))
+                tracker["staged_params"].append(self._clone_param_for_outer_state(p))
 
             # Outer optimizer on the per-shard global params (optional).
             if self.outer_lr != 1.0 and len(tracker["params"]) > 0:
@@ -638,7 +733,9 @@ class CDCOptimizer(MegatronOptimizer):
             # This is crucial: if global == local on every island, the first sync would have zero delta.
             if len(tracker["params"]) > 0:
                 # Average the cloned tensors across CDC group in-place.
-                self._all_reduce_flattened([t.data for t in tracker["params"]])
+                self._all_reduce_flattened(
+                    [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
+                )
 
             self.shard_tracker[shard_idx] = tracker
 
@@ -804,7 +901,7 @@ class CDCOptimizer(MegatronOptimizer):
             all_grads.append(snap_param.grad)
 
         # Batch All-Reduce for efficiency
-        self._all_reduce_flattened(all_grads)
+        self._all_reduce_flattened(all_grads, communication_dtype=self.outer_comm_dtype)
 
         # Outer Optimizer Step
         if self.outer_optimizer:
@@ -818,7 +915,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         # Copy back to current model parameters
         for updated_param, curr_param in zip(self.original_snapshot, self.model_param_list):
-            curr_param.copy_(updated_param.to(curr_param.device))
+            curr_param.copy_(updated_param.to(device=curr_param.device, dtype=curr_param.dtype))
 
         # Keep optimizer main params in sync with model params for mixed precision.
         if self.mixed_precision:
@@ -909,10 +1006,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         # Snapshot current local params to staged_params
         for p_local, p_staged in zip(tracker["param_refs"], tracker["staged_params"]):
-            if self.offload_outer_opt:
-                p_staged.data.copy_(p_local.detach().to("cpu"))
-            else:
-                p_staged.data.copy_(p_local.data)
+            self._copy_tensor_data(p_staged, p_local.data)
 
         tracker["old_sent_at_step"] = tracker["sent_at_step"]
         tracker["sent_at_step"] = self.step_count
@@ -942,12 +1036,12 @@ class CDCOptimizer(MegatronOptimizer):
             sync_grads.append(g)
 
         # 2. All-Reduce sync_grads (Across DiLoCo Islands)
-        self._all_reduce_flattened(sync_grads)
+        self._all_reduce_flattened(sync_grads, communication_dtype=self.outer_comm_dtype)
 
         # 3. Calculate Score for Next Selection (Norm of Global Pseudo-Gradient)
         total_norm_sq = 0.0
         for g in sync_grads:
-            total_norm_sq += g.norm(2).item() ** 2
+            total_norm_sq += float(g.float().pow(2).sum().item())
 
         # All-Reduce norm across TP group, then across PP group.
         tp_group = mpu.get_tensor_model_parallel_group()
@@ -990,12 +1084,13 @@ class CDCOptimizer(MegatronOptimizer):
         elif self.algorithm == 'streaming':
             # Alpha Blending
             for p_local, p_global in zip(param_refs, global_params):
-                if self.offload_outer_opt:
-                    p_global_data = p_global.data.to(p_local.device)
-                else:
-                    p_global_data = p_global.data
-
-                p_local.data.mul_(self.streaming_alpha).add_(p_global_data, alpha=1.0 - self.streaming_alpha)
+                p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
+                blended = (
+                    p_local.data.to(torch.float32).mul(self.streaming_alpha).add_(
+                        p_global_data, alpha=1.0 - self.streaming_alpha
+                    )
+                )
+                p_local.data.copy_(blended.to(dtype=p_local.dtype))
 
         # Keep optimizer main params in sync with model params for mixed precision.
         if self.mixed_precision:
@@ -1014,18 +1109,18 @@ class CDCOptimizer(MegatronOptimizer):
 
             for p_staged, p_local, p_global in zip(staged_params, param_refs, global_params):
                 if self.offload_outer_opt:
-                    p_local_data = p_local.detach().to("cpu")
-                    p_global_data = p_global.data
+                    p_local_data = p_local.detach().to("cpu", dtype=torch.float32)
+                    p_global_data = p_global.data.to(torch.float32)
                 else:
-                    p_local_data = p_local.data
-                    p_global_data = p_global.data
+                    p_local_data = p_local.data.to(torch.float32)
+                    p_global_data = p_global.data.to(torch.float32)
 
                 # g_1 = Staged - Local
-                g1_tensor = p_staged.data.clone().sub_(p_local_data)
+                g1_tensor = p_staged.data.to(torch.float32).sub_(p_local_data)
                 g_1.append(g1_tensor)
 
                 # D = Global - Staged
-                d_tensor = p_global_data.clone().sub_(p_staged.data)
+                d_tensor = p_global_data.sub(p_staged.data.to(torch.float32))
                 D.append(d_tensor)
 
             epsilon = 1e-8
@@ -1103,19 +1198,19 @@ class CDCOptimizer(MegatronOptimizer):
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """Compute (u, c, z_wd) in fp32 for update-space delay compensation."""
             if self.offload_outer_opt:
-                theta1 = p_local.detach().to("cpu")
-                z = p_global.data
+                theta1 = p_local.detach().to("cpu", dtype=torch.float32)
+                z = p_global.data.to(torch.float32)
             else:
-                theta1 = p_local.data
-                z = p_global.data
+                theta1 = p_local.data.to(torch.float32)
+                z = p_global.data.to(torch.float32)
 
-            theta0 = p_staged.data
+            theta0 = p_staged.data.to(torch.float32)
             z_wd = z.mul(rho) if debias_wd else z
-            D = (z_wd - theta0).to(torch.float32)
+            D = z_wd - theta0
 
-            u_total = (theta0 - theta1).to(torch.float32).div(tau)
+            u_total = (theta0 - theta1).div(tau)
             if debias_wd and rho != 1.0:
-                u_wd = theta0.to(torch.float32).mul((1.0 - rho) / tau)
+                u_wd = theta0.mul((1.0 - rho) / tau)
                 u = u_total - u_wd
             else:
                 u = u_total
@@ -1190,7 +1285,7 @@ class CDCOptimizer(MegatronOptimizer):
                 p_local.data.copy_(target.to(dtype=p_local.dtype, device=p_local.device))
     
     @torch.no_grad()
-    def _all_reduce_flattened(self, tensors):
+    def _all_reduce_flattened(self, tensors, communication_dtype=None):
         """Helper to flatten, all-reduce, and unflatten tensors."""
         from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
@@ -1213,25 +1308,33 @@ class CDCOptimizer(MegatronOptimizer):
         for dtype, group_tensors in groups.items():
             # Flatten
             flat_tensor = _flatten_dense_tensors(group_tensors)
+            original_dtype = flat_tensor.dtype
+            comm_dtype = communication_dtype if communication_dtype is not None else original_dtype
 
-            # Track size
-            total_bytes += flat_tensor.numel() * flat_tensor.element_size()
-
-            # Move to GPU for NCCL if needed
             device = flat_tensor.device
-            if self.offload_outer_opt and device.type == 'cpu':
-                gpu_tensor = flat_tensor.cuda()
-                dist.all_reduce(gpu_tensor, group=self.cdc_group)
-                flat_tensor.copy_(gpu_tensor.cpu())
-                del gpu_tensor
+            if device.type == 'cpu':
+                comm_tensor = flat_tensor.to(device='cuda', dtype=comm_dtype)
+                total_bytes += comm_tensor.numel() * comm_tensor.element_size()
+                dist.all_reduce(comm_tensor, group=self.cdc_group)
+                comm_tensor.div_(dist.get_world_size(group=self.cdc_group))
+                flat_tensor.copy_(comm_tensor.to(device=device, dtype=original_dtype))
+                del comm_tensor
             else:
-                dist.all_reduce(flat_tensor, group=self.cdc_group)
+                if comm_dtype != original_dtype:
+                    comm_tensor = flat_tensor.to(dtype=comm_dtype)
+                else:
+                    comm_tensor = flat_tensor
 
-            # Average
-            flat_tensor.div_(dist.get_world_size(group=self.cdc_group))
+                total_bytes += comm_tensor.numel() * comm_tensor.element_size()
+                dist.all_reduce(comm_tensor, group=self.cdc_group)
+                comm_tensor.div_(dist.get_world_size(group=self.cdc_group))
+                if comm_tensor is not flat_tensor:
+                    flat_tensor.copy_(comm_tensor.to(dtype=original_dtype))
 
             # Unflatten and copy back to grads
-            for t, synced_t in zip(group_tensors, _unflatten_dense_tensors(flat_tensor, group_tensors)):
+            for t, synced_t in zip(
+                group_tensors, _unflatten_dense_tensors(flat_tensor, group_tensors)
+            ):
                 t.copy_(synced_t)
 
         end_time = time.time()

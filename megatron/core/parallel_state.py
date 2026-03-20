@@ -834,7 +834,18 @@ def initialize_model_parallel(
     #         _DATA_PARALLEL_GLOBAL_RANKS = ranks
     # CHANGE: DiLoCo / CDC: Split global DP ranks into Inner DP (Megatron) and Outer DP (Cross-DC)
     all_dp_ranks_lists = list(generator_wrapper('dp'))
-    
+    rank_to_cdc_index = {}
+
+    def split_ranks_by_cdc(ranks):
+        """Split a rank list that spans the DP dimension into per-island subgroups."""
+        if cdc_parallel_size == 1:
+            return [ranks]
+
+        split_ranks = [[] for _ in range(cdc_parallel_size)]
+        for global_rank in ranks:
+            split_ranks[rank_to_cdc_index[global_rank]].append(global_rank)
+        return [sub_ranks for sub_ranks in split_ranks if sub_ranks]
+
     for global_dp_ranks in all_dp_ranks_lists:
         assert len(global_dp_ranks) == data_parallel_size
         
@@ -843,6 +854,8 @@ def initialize_model_parallel(
             start_idx = i * inner_data_parallel_size
             end_idx = (i + 1) * inner_data_parallel_size
             inner_dp_ranks = global_dp_ranks[start_idx:end_idx]
+            for global_rank in inner_dp_ranks:
+                rank_to_cdc_index[global_rank] = i
             
             group = create_group(
                 inner_dp_ranks,
@@ -878,88 +891,91 @@ def initialize_model_parallel(
                 _MPU_CDC_PARALLEL_RANK = outer_dp_ranks.index(rank)
 
     assert (
-        data_parallel_size * context_parallel_size
+        inner_data_parallel_size * context_parallel_size
     ) % num_distributed_optimizer_instances == 0, (
         'Data parallel size should be divisible by partial DistOpt shard factor'
     )
     intra_partial_data_parallel_size = (
-        data_parallel_size * context_parallel_size
+        inner_data_parallel_size * context_parallel_size
     ) // num_distributed_optimizer_instances
 
     for ranks_with_cp in generator_wrapper('dp-cp'):
-        group_with_cp = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP',
-        )
-        if create_gloo_process_groups:
-            group_with_cp_gloo = create_group(
-                ranks_with_cp,
+        for inner_ranks_with_cp in split_ranks_by_cdc(ranks_with_cp):
+            group_with_cp = create_group(
+                inner_ranks_with_cp,
                 timeout=timeout,
-                backend="gloo",
-                group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP',
             )
-        else:
-            group_with_cp_gloo = None
-        if rank in ranks_with_cp:
-            _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
-            _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
-
-        if num_distributed_optimizer_instances > 1:
-            # Create groups for Partial DistOpt, one for intra-partial DP domain
-            # Another for inter-partial DP domain
-            for i in range(num_distributed_optimizer_instances):
-                intra_partial_data_parallel_ranks_with_cp = ranks_with_cp[
-                    (i * intra_partial_data_parallel_size) : (
-                        (i + 1) * intra_partial_data_parallel_size
-                    )
-                ]
-
-                intra_partial_data_parallel_group_with_cp = create_group(
-                    intra_partial_data_parallel_ranks_with_cp,
+            if create_gloo_process_groups:
+                group_with_cp_gloo = create_group(
+                    inner_ranks_with_cp,
                     timeout=timeout,
-                    pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
-                    group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
+                    backend="gloo",
+                    group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
                 )
-                if create_gloo_process_groups:
-                    intra_partial_data_parallel_group_with_cp_gloo = create_group(
+            else:
+                group_with_cp_gloo = None
+            if rank in inner_ranks_with_cp:
+                _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+                _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
+                _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = inner_ranks_with_cp
+
+            if num_distributed_optimizer_instances > 1:
+                # Create groups for Partial DistOpt, one for intra-partial DP domain
+                # Another for inter-partial DP domain
+                for i in range(num_distributed_optimizer_instances):
+                    intra_partial_data_parallel_ranks_with_cp = inner_ranks_with_cp[
+                        (i * intra_partial_data_parallel_size) : (
+                            (i + 1) * intra_partial_data_parallel_size
+                        )
+                    ]
+
+                    intra_partial_data_parallel_group_with_cp = create_group(
                         intra_partial_data_parallel_ranks_with_cp,
                         timeout=timeout,
-                        backend="gloo",
-                        group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                        pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
+                        group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
                     )
-                else:
-                    intra_partial_data_parallel_group_with_cp_gloo = None
+                    if create_gloo_process_groups:
+                        intra_partial_data_parallel_group_with_cp_gloo = create_group(
+                            intra_partial_data_parallel_ranks_with_cp,
+                            timeout=timeout,
+                            backend="gloo",
+                            group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                        )
+                    else:
+                        intra_partial_data_parallel_group_with_cp_gloo = None
 
-                if rank in intra_partial_data_parallel_ranks_with_cp:
-                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
-                        intra_partial_data_parallel_group_with_cp
+                    if rank in intra_partial_data_parallel_ranks_with_cp:
+                        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
+                            intra_partial_data_parallel_group_with_cp
+                        )
+                        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
+                            intra_partial_data_parallel_group_with_cp_gloo
+                        )
+
+                for i in range(intra_partial_data_parallel_size):
+                    inter_partial_data_parallel_ranks_with_cp = inner_ranks_with_cp[
+                        i::intra_partial_data_parallel_size
+                    ]
+
+                    inter_partial_data_parallel_group_with_cp = create_group(
+                        inter_partial_data_parallel_ranks_with_cp,
+                        timeout=timeout,
+                        pg_options=get_nccl_options('inter_dp_cp', nccl_comm_cfgs),
+                        group_desc='INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
                     )
-                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
-                        intra_partial_data_parallel_group_with_cp_gloo
-                    )
 
-            for i in range(intra_partial_data_parallel_size):
-                inter_partial_data_parallel_ranks_with_cp = ranks_with_cp[
-                    i::intra_partial_data_parallel_size
-                ]
-
-                inter_partial_data_parallel_group_with_cp = create_group(
-                    inter_partial_data_parallel_ranks_with_cp,
-                    timeout=timeout,
-                    pg_options=get_nccl_options('inter_dp_cp', nccl_comm_cfgs),
-                    group_desc='INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
+                    if rank in inter_partial_data_parallel_ranks_with_cp:
+                        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
+                            inter_partial_data_parallel_group_with_cp
+                        )
+            else:
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
+                    _DATA_PARALLEL_GROUP_WITH_CP_GLOO
                 )
-
-                if rank in inter_partial_data_parallel_ranks_with_cp:
-                    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
-                        inter_partial_data_parallel_group_with_cp
-                    )
-        else:
-            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
-            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
     # Apply SHARP to DP process groups
     if use_sharp:
@@ -1160,23 +1176,25 @@ def initialize_model_parallel(
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
     for ranks in generator_wrapper('tp-dp-cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs),
-            group_desc='TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP',
-        )
-        if rank in ranks:
-            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
+        for inner_ranks in split_ranks_by_cdc(ranks):
+            group = create_group(
+                inner_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs),
+                group_desc='TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP',
+            )
+            if rank in inner_ranks:
+                _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
     for ranks in generator_wrapper('tp-dp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs),
-            group_desc='TENSOR_AND_DATA_PARALLEL_GROUP',
-        )
-        if rank in ranks:
-            _TENSOR_AND_DATA_PARALLEL_GROUP = group
+        for inner_ranks in split_ranks_by_cdc(ranks):
+            group = create_group(
+                inner_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs),
+                group_desc='TENSOR_AND_DATA_PARALLEL_GROUP',
+            )
+            if rank in inner_ranks:
+                _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     assert (
@@ -1257,21 +1275,22 @@ def initialize_model_parallel(
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, 'Expert data group-gloo is already initialized'
 
     for ranks in generator_wrapper('dp', is_expert=True):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options('ep_dp', nccl_comm_cfgs),
-            group_desc='EXPERT_DATA_PARALLEL_GROUP',
-        )
-        if create_gloo_process_groups:
-            group_gloo = create_group(
-                ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
+        for inner_ranks in split_ranks_by_cdc(ranks):
+            group = create_group(
+                inner_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('ep_dp', nccl_comm_cfgs),
+                group_desc='EXPERT_DATA_PARALLEL_GROUP',
             )
-        else:
-            group_gloo = None
-        if rank in ranks:
-            _EXPERT_DATA_PARALLEL_GROUP = group
-            _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
+            if create_gloo_process_groups:
+                group_gloo = create_group(
+                    inner_ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
+                )
+            else:
+                group_gloo = None
+            if rank in inner_ranks:
+                _EXPERT_DATA_PARALLEL_GROUP = group
+                _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
     ### End of expert related parallel groups initialization
 
     # Initialize global memory buffer
@@ -2118,6 +2137,18 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+
+    global _CDC_PARALLEL_GROUP
+    _CDC_PARALLEL_GROUP = None
+
+    global _CDC_PARALLEL_GLOBAL_RANKS
+    _CDC_PARALLEL_GLOBAL_RANKS = None
+
+    global _MPU_CDC_PARALLEL_WORLD_SIZE
+    _MPU_CDC_PARALLEL_WORLD_SIZE = None
+
+    global _MPU_CDC_PARALLEL_RANK
+    _MPU_CDC_PARALLEL_RANK = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
