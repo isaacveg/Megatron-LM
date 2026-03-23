@@ -49,10 +49,38 @@ class CDCOptimizer(MegatronOptimizer):
         self.delay = getattr(args, 'cdc_delay', getattr(args, 'diloco_delay', 0))
         self.dc_N = getattr(args, 'cdc_dc_N', getattr(args, 'diloco_dc_N', 4))
         self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'stride')
+        self.moe_param_mode = str(getattr(args, 'cdc_moe_param_mode', 'all')).lower()
+        self.expert_sync_interval = int(getattr(args, 'cdc_moe_expert_sync_interval', 0))
+        self.expert_sync_offset = int(getattr(args, 'cdc_moe_expert_sync_offset', 0))
+        self.expert_selection = str(getattr(args, 'cdc_moe_expert_selection', 'score')).lower()
+        self.expert_topk = int(getattr(args, 'cdc_moe_expert_topk', 1))
+        self.expert_score_mode = str(
+            getattr(args, 'cdc_moe_expert_score_mode', 'update_norm')
+        ).lower()
+        self.expert_max_age_slots = int(getattr(args, 'cdc_moe_expert_max_age_slots', 0))
+        self.expert_max_staleness = int(getattr(args, 'cdc_moe_expert_max_staleness', 0))
         self.verbose = getattr(args, 'cdc_verbose', False)
         self.mixed_precision = getattr(args, 'bf16', False) or getattr(args, 'fp16', False)
-        model_params = self.model_param_list
-        self.model_param_dtype = model_params[0].dtype if model_params else torch.float32
+        self._named_model_param_list = self._iter_named_trainable_params_unique(self.model_chunks)
+        self._expert_named_model_params = self._collect_routed_expert_named_params(
+            self._named_model_param_list
+        )
+        self._tracked_named_model_params = self._filter_named_params_for_cdc(
+            self._named_model_param_list
+        )
+        self.enable_moe_expert_refresh = (
+            self.moe_param_mode == 'dense-expert-hybrid'
+            and self.algorithm == 'streaming'
+            and len(self._expert_named_model_params) > 0
+            and self.expert_sync_interval > 0
+        )
+        self.track_expert_token_load = (
+            self.enable_moe_expert_refresh
+            and self.expert_selection == 'score'
+            and self.expert_score_mode in {'token_load', 'mixed'}
+        )
+        tracked_params = self.tracked_model_param_list
+        self.model_param_dtype = tracked_params[0].dtype if tracked_params else torch.float32
         # Follow Streaming DiLoCo: keep outer-state math in fp32, but keep communication low
         # precision by default to avoid doubling bandwidth.
         self.outer_state_dtype = torch.float32 if self.mixed_precision else self.model_param_dtype
@@ -63,7 +91,33 @@ class CDCOptimizer(MegatronOptimizer):
         self.dc_type = str(getattr(args, "cdc_dc_type", "update")).lower()
         # Initialized for all algorithms so checkpoint/state construction does not fail.
         self.next_shard_idx = 0
+        self.next_expert_group_idx = 0
+        self.expert_sync_event_count = 0
         self._cdc_state_loaded = False
+
+        if self.moe_param_mode == 'dense-expert-hybrid' and self.algorithm != 'streaming':
+            raise ValueError(
+                "cdc_moe_param_mode=dense-expert-hybrid currently only supports "
+                "cdc_algorithm=streaming."
+            )
+        if self.expert_topk < 1:
+            raise ValueError(f"cdc_moe_expert_topk must be >= 1, got {self.expert_topk}")
+        if self.expert_selection not in {'round_robin', 'score'}:
+            raise ValueError(
+                f"Unknown cdc_moe_expert_selection: {self.expert_selection}"
+            )
+        if self.expert_score_mode not in {'update_norm', 'token_load', 'mixed'}:
+            raise ValueError(
+                f"Unknown cdc_moe_expert_score_mode: {self.expert_score_mode}"
+            )
+        if self.enable_moe_expert_refresh and int(getattr(args, 'expert_model_parallel_size', 1)) != 1:
+            raise NotImplementedError(
+                "dense-expert-hybrid currently supports expert_model_parallel_size=1 only."
+            )
+
+        self._moe_module_index = (
+            self._build_moe_module_index() if self.track_expert_token_load else {}
+        )
 
         # Track per-param-group LR/WD history for DC debiasing.
         self._optimizer_param_id_to_group_idx: Dict[int, int] = {}
@@ -76,7 +130,10 @@ class CDCOptimizer(MegatronOptimizer):
             print_rank_0(
                 f"[CDC] Initialized {self.algorithm} optimizer. Sync interval: "
                 f"{self.sync_interval}, Shards: {self.num_shards}, "
-                f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}"
+                f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}, "
+                f"moe_param_mode={self.moe_param_mode}, "
+                f"expert_refresh={'on' if self.enable_moe_expert_refresh else 'off'}, "
+                f"expert_topk={self.expert_topk}, expert_score_mode={self.expert_score_mode}"
             )
         
         if self.algorithm == 'diloco':
@@ -217,12 +274,20 @@ class CDCOptimizer(MegatronOptimizer):
         """返回遍历model_chunks后保存到一个展平列表的params
         named_parameters()会自动去重
         """
+        if hasattr(self, "_named_model_param_list"):
+            return [p for _, p in self._named_model_param_list]
         model_param_list = []
         for chunk in self.model_chunks:
             for name, p in chunk.named_parameters():
                 if p.requires_grad:
                     model_param_list.append(p)
         return model_param_list
+
+    @property
+    def tracked_model_param_list(self):
+        if hasattr(self, "_tracked_named_model_params"):
+            return [p for _, p in self._tracked_named_model_params]
+        return self.model_param_list
 
     def get_loss_scale(self):
         return self.inner_optimizer.get_loss_scale()
@@ -323,23 +388,27 @@ class CDCOptimizer(MegatronOptimizer):
             "algorithm": self.algorithm,
             "step_count": self.step_count,
             "next_shard_idx": self.next_shard_idx,
+            "next_expert_group_idx": self.next_expert_group_idx,
+            "expert_sync_event_count": self.expert_sync_event_count,
             "lr_wd_tracking": self._serialize_lr_wd_tracking(),
         }
 
         if self.algorithm == 'diloco' and getattr(self, "original_snapshot", None) is not None:
             state["diloco"] = self._serialize_diloco_state()
         elif self.algorithm in ['streaming', 'dc'] and getattr(self, "shard_tracker", None) is not None:
-            state["shards"] = self._serialize_shard_trackers()
+            state["shards"] = self._serialize_tracker_dict(self.shard_tracker)
+            if getattr(self, "expert_shard_tracker", None):
+                state["expert_shards"] = self._serialize_tracker_dict(self.expert_shard_tracker)
 
         return state
 
-    def _serialize_shard_trackers(self):
+    def _serialize_tracker_dict(self, tracker_dict):
         shards = []
-        if not self.shard_tracker:
+        if not tracker_dict:
             return shards
 
-        for shard_idx in sorted(self.shard_tracker.keys()):
-            tracker = self.shard_tracker[shard_idx]
+        for shard_idx in sorted(tracker_dict.keys()):
+            tracker = tracker_dict[shard_idx]
 
             # Optimization: staged_params is only needed if a sync is in flight.
             # If next_receive_step is 0 (or <= step_count, meaning completed), it's redundant.
@@ -347,6 +416,7 @@ class CDCOptimizer(MegatronOptimizer):
 
             shard_entry = {
                 "shard_idx": shard_idx,
+                "display_name": tracker.get("display_name", str(shard_idx)),
                 "params": [self._clone_tensor_to_cpu(p) for p in tracker["params"]],
                 "staged_params": [self._clone_tensor_to_cpu(p) for p in tracker["staged_params"]] if save_staged else None,
                 "sent_at_step": int(tracker["sent_at_step"]),
@@ -355,6 +425,11 @@ class CDCOptimizer(MegatronOptimizer):
                 "sent_wd_log_cumsums": deepcopy(tracker.get("sent_wd_log_cumsums")) if save_staged else None,
                 "global_num_params": int(tracker["global_num_params"]),
                 "last_score": float(tracker["last_score"]),
+                "last_token_load": float(tracker.get("last_token_load", 0.0)),
+                "token_load_accum": float(tracker.get("token_load_accum", 0.0)),
+                "sent_at_expert_event": int(tracker.get("sent_at_expert_event", 0)),
+                "moe_module_key": tracker.get("moe_module_key"),
+                "local_expert_idx": tracker.get("local_expert_idx"),
             }
 
             if tracker.get("outer_optimizer") is not None:
@@ -403,6 +478,12 @@ class CDCOptimizer(MegatronOptimizer):
 
         self.step_count = cdc_state.get("step_count", self.step_count)
         self.next_shard_idx = cdc_state.get("next_shard_idx", self.next_shard_idx)
+        self.next_expert_group_idx = cdc_state.get(
+            "next_expert_group_idx", self.next_expert_group_idx
+        )
+        self.expert_sync_event_count = cdc_state.get(
+            "expert_sync_event_count", self.expert_sync_event_count
+        )
 
         # Restore LR/WD tracking (best-effort; older checkpoints may not have it).
         tracking = cdc_state.get("lr_wd_tracking")
@@ -417,7 +498,11 @@ class CDCOptimizer(MegatronOptimizer):
         if self.algorithm == 'diloco':
             self._load_diloco_state(cdc_state.get("diloco"))
         elif self.algorithm in ['streaming', 'dc']:
-            self._load_shard_trackers(cdc_state.get("shards"))
+            self._load_tracker_dict(self.shard_tracker, cdc_state.get("shards"))
+            if getattr(self, "expert_shard_tracker", None) is not None:
+                self._load_tracker_dict(
+                    self.expert_shard_tracker, cdc_state.get("expert_shards")
+                )
 
     def _load_diloco_state(self, diloco_state):
         if not diloco_state:
@@ -427,7 +512,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         # Optimization: If snapshot is None, it means it was identical to local params.
         if snapshot is None:
-            for target, local in zip(self.original_snapshot, self.model_param_list):
+            for target, local in zip(self.original_snapshot, self.tracked_model_param_list):
                 self._copy_tensor_data(target, local)
         else:
             for target, saved in zip(self.original_snapshot, snapshot):
@@ -442,19 +527,16 @@ class CDCOptimizer(MegatronOptimizer):
             )
             self._move_optimizer_state_to_device(self.outer_optimizer, device)
 
-    def _load_shard_trackers(self, shard_states):
+    def _load_tracker_dict(self, tracker_dict, shard_states):
         if not shard_states:
             return
 
-        if self.shard_tracker is None:
-            self._init_streaming_state()
-
         for shard_state in shard_states:
             shard_idx = shard_state["shard_idx"]
-            if shard_idx not in self.shard_tracker:
+            if shard_idx not in tracker_dict:
                 raise ValueError(f"Shard {shard_idx} not initialized but present in checkpoint.")
 
-            tracker = self.shard_tracker[shard_idx]
+            tracker = tracker_dict[shard_idx]
 
             self._copy_tensor_list(tracker["params"], shard_state.get("params", []))
 
@@ -473,6 +555,24 @@ class CDCOptimizer(MegatronOptimizer):
             )
             tracker["global_num_params"] = shard_state.get("global_num_params", tracker["global_num_params"])
             tracker["last_score"] = shard_state.get("last_score", tracker["last_score"])
+            tracker["last_token_load"] = shard_state.get(
+                "last_token_load", tracker.get("last_token_load", 0.0)
+            )
+            tracker["token_load_accum"] = shard_state.get(
+                "token_load_accum", tracker.get("token_load_accum", 0.0)
+            )
+            tracker["sent_at_expert_event"] = shard_state.get(
+                "sent_at_expert_event", tracker.get("sent_at_expert_event", 0)
+            )
+            tracker["display_name"] = shard_state.get(
+                "display_name", tracker.get("display_name", str(shard_idx))
+            )
+            tracker["moe_module_key"] = shard_state.get(
+                "moe_module_key", tracker.get("moe_module_key")
+            )
+            tracker["local_expert_idx"] = shard_state.get(
+                "local_expert_idx", tracker.get("local_expert_idx")
+            )
 
             outer_state = shard_state.get("outer_optimizer")
             if tracker.get("outer_optimizer") is not None and outer_state is not None:
@@ -524,14 +624,231 @@ class CDCOptimizer(MegatronOptimizer):
             device=target_device, dtype=self.outer_state_dtype, copy=True
         )
 
+    @staticmethod
+    def _is_routed_expert_param_name(param_name: str) -> bool:
+        return '.experts.' in param_name and '.shared_experts.' not in param_name
+
+    @staticmethod
+    def _routed_expert_group_key(param_name: str) -> Optional[str]:
+        match = re.search(r"(.*?\.experts\.local_experts\.\d+)\.", param_name)
+        if match is None:
+            return None
+        return match.group(1)
+
+    def _collect_routed_expert_named_params(
+        self, named_params: List[Tuple[str, torch.nn.Parameter]]
+    ) -> List[Tuple[str, torch.nn.Parameter]]:
+        return [
+            (name, param)
+            for name, param in named_params
+            if self._is_routed_expert_param_name(name)
+        ]
+
+    @staticmethod
+    def _normalize_module_name(name: str) -> str:
+        normalized = name
+        while normalized.startswith("module."):
+            normalized = normalized[len("module.") :]
+        return normalized
+
+    def _extract_expert_group_metadata(self, group_name: str) -> Tuple[str, Optional[int], Optional[int]]:
+        normalized = self._normalize_module_name(group_name)
+        module_match = re.match(r"(.*)\.experts\.local_experts\.(\d+)$", normalized)
+        if module_match is None:
+            return normalized, None, None
+
+        module_key = module_match.group(1)
+        expert_idx = int(module_match.group(2))
+        layer_idx = self._parse_layer_index(module_key)
+        return module_key, layer_idx, expert_idx
+
+    def _expert_group_sort_key(self, group_name: str) -> Tuple[int, int, str]:
+        _, layer_idx, expert_idx = self._extract_expert_group_metadata(group_name)
+        return (
+            layer_idx if layer_idx is not None else 10**9,
+            expert_idx if expert_idx is not None else 10**9,
+            self._normalize_module_name(group_name),
+        )
+
+    @staticmethod
+    def _iter_named_modules_unique(
+        model_chunks: List[MegatronModule],
+    ) -> List[Tuple[str, torch.nn.Module]]:
+        results: List[Tuple[str, torch.nn.Module]] = []
+        seen_ids = set()
+        for chunk in model_chunks:
+            for name, module in chunk.named_modules():
+                mid = id(module)
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                results.append((name, module))
+        return results
+
+    def _build_moe_module_index(self) -> Dict[str, torch.nn.Module]:
+        module_index: Dict[str, torch.nn.Module] = {}
+        for name, module in self._iter_named_modules_unique(self.model_chunks):
+            normalized_name = self._normalize_module_name(name)
+            if not normalized_name:
+                continue
+            if hasattr(module, "token_dispatcher") and hasattr(module, "experts"):
+                module_index[normalized_name] = module
+        return module_index
+
+    def _filter_named_params_for_cdc(
+        self, named_params: List[Tuple[str, torch.nn.Parameter]]
+    ) -> List[Tuple[str, torch.nn.Parameter]]:
+        if self.moe_param_mode == 'all':
+            return list(named_params)
+        if self.moe_param_mode not in {'dense-only', 'dense-expert-hybrid'}:
+            raise ValueError(f"Unknown cdc_moe_param_mode: {self.moe_param_mode}")
+
+        tracked: List[Tuple[str, torch.nn.Parameter]] = []
+        excluded_tensors = 0
+        excluded_numel = 0
+
+        for name, param in named_params:
+            if self._is_routed_expert_param_name(name):
+                excluded_tensors += 1
+                excluded_numel += param.numel()
+                continue
+            tracked.append((name, param))
+
+        if not tracked:
+            raise ValueError(
+                f"cdc_moe_param_mode={self.moe_param_mode} excluded every trainable parameter. "
+                "Check the model structure and CDC param filter."
+            )
+
+        if self.verbose and excluded_tensors > 0:
+            tracked_numel = sum(param.numel() for _, param in tracked)
+            excluded_note = (
+                "kept for expert refresh"
+                if self.moe_param_mode == 'dense-expert-hybrid'
+                else "kept_local_only"
+            )
+            print_rank_0(
+                f"[CDC] MoE {self.moe_param_mode} mode excludes routed expert params from the "
+                f"dense rolling queue: "
+                f"{excluded_tensors} tensors, {excluded_numel} params {excluded_note}; "
+                f"CDC tracks {len(tracked)} tensors, {tracked_numel} params."
+            )
+
+        return tracked
+
+    def _group_routed_expert_named_params(
+        self,
+    ) -> Dict[str, List[Tuple[str, torch.nn.Parameter]]]:
+        grouped: Dict[str, List[Tuple[str, torch.nn.Parameter]]] = {}
+        for name, param in self._expert_named_model_params:
+            group_key = self._routed_expert_group_key(name)
+            if group_key is None:
+                continue
+            grouped.setdefault(group_key, []).append((name, param))
+        return grouped
+
+    def _build_tracker(
+        self,
+        param_refs: List[torch.nn.Parameter],
+        *,
+        tp_group,
+        pp_group,
+        display_name: str,
+        moe_module_key: Optional[str] = None,
+        local_expert_idx: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        param_group_indices = [
+            self._get_param_group_index_for_model_param(p) for p in param_refs
+        ]
+        unique_param_group_indices = sorted(
+            {i for i in param_group_indices if i is not None}
+        )
+
+        tracker = {
+            "display_name": display_name,
+            "param_refs": param_refs,
+            "param_group_indices": param_group_indices,
+            "unique_param_group_indices": unique_param_group_indices,
+            "sent_wd_log_cumsums": None,
+            "params": [],
+            "staged_params": [],
+            "sent_at_step": 0,
+            "old_sent_at_step": 0,
+            "next_receive_step": 0,
+            "global_num_params": 0,
+            "last_score": 0.0,
+            "last_token_load": 0.0,
+            "token_load_accum": 0.0,
+            "sent_at_expert_event": 0,
+            "moe_module_key": moe_module_key,
+            "local_expert_idx": local_expert_idx,
+        }
+
+        for p in param_refs:
+            tracker["params"].append(self._clone_param_for_outer_state(p))
+            tracker["staged_params"].append(self._clone_param_for_outer_state(p))
+
+        if self.outer_lr != 1.0 and len(tracker["params"]) > 0:
+            for p in tracker["params"]:
+                p.requires_grad_(True)
+            tracker["outer_optimizer"] = SGD(
+                tracker["params"],
+                lr=self.outer_lr,
+                momentum=0.9,
+                nesterov=True,
+            )
+        else:
+            tracker["outer_optimizer"] = None
+
+        local_numel = sum(p.numel() for p in param_refs)
+        global_numel = self._all_reduce_scalar_sum(local_numel, group=tp_group)
+        global_numel = self._all_reduce_scalar_sum(global_numel, group=pp_group)
+        tracker["global_num_params"] = int(global_numel)
+
+        if len(tracker["params"]) > 0:
+            self._all_reduce_flattened(
+                [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
+            )
+
+        return tracker
+
+    def _reset_tracker_dict_from_model(self, tracker_dict: Optional[Dict[int, Dict[str, Any]]]) -> None:
+        if not tracker_dict:
+            return
+
+        for tracker in tracker_dict.values():
+            for p_global, p_local in zip(tracker["params"], tracker["param_refs"]):
+                self._copy_tensor_data(p_global, p_local.data)
+            for p_staged, p_local in zip(tracker["staged_params"], tracker["param_refs"]):
+                self._copy_tensor_data(p_staged, p_local.data)
+
+            tracker["sent_wd_log_cumsums"] = None
+            tracker["sent_at_step"] = 0
+            tracker["old_sent_at_step"] = 0
+            tracker["next_receive_step"] = 0
+            tracker["last_score"] = 0.0
+            tracker["last_token_load"] = 0.0
+            tracker["token_load_accum"] = 0.0
+            tracker["sent_at_expert_event"] = 0
+
+            if tracker["outer_optimizer"] is not None:
+                tracker["outer_optimizer"].state.clear()
+
+            if tracker["params"]:
+                self._all_reduce_flattened(
+                    [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
+                )
+
     def _reset_outer_state_from_model(self) -> None:
         """Reinitialize CDC outer state from the current model parameters."""
         self.step_count = 0
         self.next_shard_idx = 0
+        self.next_expert_group_idx = 0
+        self.expert_sync_event_count = 0
         self._init_lr_wd_tracking()
 
         if self.algorithm == 'diloco' and getattr(self, "original_snapshot", None) is not None:
-            for target, local in zip(self.original_snapshot, self.model_param_list):
+            for target, local in zip(self.original_snapshot, self.tracked_model_param_list):
                 self._copy_tensor_data(target, local.data)
             if self.original_snapshot:
                 self._all_reduce_flattened(
@@ -544,31 +861,14 @@ class CDCOptimizer(MegatronOptimizer):
         if self.algorithm not in ['streaming', 'dc'] or getattr(self, "shard_tracker", None) is None:
             return
 
-        for tracker in self.shard_tracker.values():
-            for p_global, p_local in zip(tracker["params"], tracker["param_refs"]):
-                self._copy_tensor_data(p_global, p_local.data)
-            for p_staged, p_local in zip(tracker["staged_params"], tracker["param_refs"]):
-                self._copy_tensor_data(p_staged, p_local.data)
-
-            tracker["sent_wd_log_cumsums"] = None
-            tracker["sent_at_step"] = 0
-            tracker["old_sent_at_step"] = 0
-            tracker["next_receive_step"] = 0
-            tracker["last_score"] = 0.0
-
-            if tracker["outer_optimizer"] is not None:
-                tracker["outer_optimizer"].state.clear()
-
-            if tracker["params"]:
-                self._all_reduce_flattened(
-                    [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
-                )
+        self._reset_tracker_dict_from_model(self.shard_tracker)
+        self._reset_tracker_dict_from_model(getattr(self, "expert_shard_tracker", None))
 
     def _init_diloco_state(self):
         """Initialize state for standard DiLoCo."""
         self.original_snapshot = []  # 上一次同步时的模型参数快照（展平列表）
 
-        for param in self.model_param_list:
+        for param in self.tracked_model_param_list:
             self.original_snapshot.append(self._clone_param_for_outer_state(param).requires_grad_(True))
 
         # Initialize outer optimizer (Nesterov SGD)
@@ -655,7 +955,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         # Build local shard assignment: shard_idx -> list[param_ref]
         shard_to_param_refs: Dict[int, List[torch.nn.Parameter]] = {i: [] for i in range(self.num_shards)}
-        unique_named_params = self._iter_named_trainable_params_unique(self.model_chunks)
+        unique_named_params = list(self._tracked_named_model_params)
         for name, param in unique_named_params:
             # 如果tie embedding，只用一个 shard 存output layer和input layer
             # 否则用 0 存 embedding，1 存 output layer
@@ -676,66 +976,20 @@ class CDCOptimizer(MegatronOptimizer):
         # Initialize trackers.
         self.shard_tracker = {}
         self.next_shard_idx = 0
+        self.expert_shard_tracker = {}
+        self.next_expert_group_idx = 0
 
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
 
         for shard_idx in range(self.num_shards):
             param_refs = shard_to_param_refs.get(shard_idx, [])
-
-            param_group_indices = [
-                self._get_param_group_index_for_model_param(p) for p in param_refs
-            ]
-            unique_param_group_indices = sorted(
-                {i for i in param_group_indices if i is not None}
+            tracker = self._build_tracker(
+                param_refs,
+                tp_group=tp_group,
+                pp_group=pp_group,
+                display_name=f"dense-shard-{shard_idx}",
             )
-
-            tracker = {
-                "param_refs": param_refs,
-                "param_group_indices": param_group_indices,
-                "unique_param_group_indices": unique_param_group_indices,
-                # Populated at send time to enable accurate WD debias even with lr-warmup-fraction.
-                "sent_wd_log_cumsums": None,
-                "params": [],
-                "staged_params": [],
-                "sent_at_step": 0,
-                "old_sent_at_step": 0,
-                "next_receive_step": 0,
-                "global_num_params": 0,
-                "last_score": 0.0,
-            }
-
-            # Clone for global / staged buffers.
-            for p in param_refs:
-                tracker["params"].append(self._clone_param_for_outer_state(p))
-                tracker["staged_params"].append(self._clone_param_for_outer_state(p))
-
-            # Outer optimizer on the per-shard global params (optional).
-            if self.outer_lr != 1.0 and len(tracker["params"]) > 0:
-                for p in tracker["params"]:
-                    p.requires_grad_(True)
-                tracker["outer_optimizer"] = SGD(
-                    tracker["params"],
-                    lr=self.outer_lr,
-                    momentum=0.9,
-                    nesterov=True,
-                )
-            else:
-                tracker["outer_optimizer"] = None
-
-            # Compute global shard param count across TP and PP for consistent selection.
-            local_numel = sum(p.numel() for p in param_refs)
-            global_numel = self._all_reduce_scalar_sum(local_numel, group=tp_group)
-            global_numel = self._all_reduce_scalar_sum(global_numel, group=pp_group)
-            tracker["global_num_params"] = int(global_numel)
-
-            # Initialize global params to the cross-DC average (within this PP/TP partition).
-            # This is crucial: if global == local on every island, the first sync would have zero delta.
-            if len(tracker["params"]) > 0:
-                # Average the cloned tensors across CDC group in-place.
-                self._all_reduce_flattened(
-                    [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
-                )
 
             self.shard_tracker[shard_idx] = tracker
 
@@ -744,6 +998,38 @@ class CDCOptimizer(MegatronOptimizer):
                     f"[CDC] Shard {shard_idx} initialized: local_tensors={len(param_refs)}, "
                     f"global_numel={tracker['global_num_params']}"
                 )
+
+        if self.enable_moe_expert_refresh:
+            expert_groups = self._group_routed_expert_named_params()
+            if not expert_groups:
+                raise ValueError(
+                    "cdc_moe_param_mode=dense-expert-hybrid requested expert refresh, "
+                    "but no routed expert parameter groups were discovered."
+                )
+
+            for expert_idx, expert_group_name in enumerate(
+                sorted(expert_groups.keys(), key=self._expert_group_sort_key)
+            ):
+                expert_param_refs = [param for _, param in expert_groups[expert_group_name]]
+                moe_module_key, _, local_expert_idx = self._extract_expert_group_metadata(
+                    expert_group_name
+                )
+                tracker = self._build_tracker(
+                    expert_param_refs,
+                    tp_group=tp_group,
+                    pp_group=pp_group,
+                    display_name=expert_group_name,
+                    moe_module_key=moe_module_key,
+                    local_expert_idx=local_expert_idx,
+                )
+                self.expert_shard_tracker[expert_idx] = tracker
+
+                if self.verbose:
+                    print_rank_0(
+                        f"[CDC] Expert group {expert_idx} ({expert_group_name}) initialized: "
+                        f"local_tensors={len(expert_param_refs)}, "
+                        f"global_numel={tracker['global_num_params']}"
+                    )
 
     @staticmethod
     def _tracker_has_any_params(tracker: Dict[str, Any]) -> bool:
@@ -854,6 +1140,78 @@ class CDCOptimizer(MegatronOptimizer):
         dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
         return float(t.item())
 
+    def _all_reduce_vector_sum(self, values: List[float], group) -> List[float]:
+        if not values:
+            return []
+        if group is None:
+            return [float(v) for v in values]
+        try:
+            if dist.get_world_size(group=group) <= 1:
+                return [float(v) for v in values]
+        except Exception:
+            return [float(v) for v in values]
+
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        tensor = torch.tensor(values, device=device, dtype=torch.float32)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        return [float(v) for v in tensor.cpu().tolist()]
+
+    def _collect_current_expert_token_loads(self) -> Dict[int, float]:
+        if not self.enable_moe_expert_refresh or not getattr(self, "expert_shard_tracker", None):
+            return {}
+
+        module_load_cache: Dict[str, List[float]] = {}
+        loads: Dict[int, float] = {}
+
+        for tracker_idx, tracker in self.expert_shard_tracker.items():
+            module_key = tracker.get("moe_module_key")
+            local_expert_idx = tracker.get("local_expert_idx")
+            load_value = 0.0
+
+            if module_key is not None and local_expert_idx is not None:
+                if module_key not in module_load_cache:
+                    module = self._moe_module_index.get(module_key)
+                    expert_loads: List[float] = []
+                    if module is not None:
+                        token_dispatcher = getattr(module, "token_dispatcher", None)
+                        load_tensor = None
+                        if token_dispatcher is not None:
+                            load_tensor = getattr(
+                                token_dispatcher, "num_global_tokens_per_local_expert", None
+                            )
+                            if load_tensor is None:
+                                load_tensor = getattr(token_dispatcher, "tokens_per_expert", None)
+
+                        if torch.is_tensor(load_tensor):
+                            tensor = load_tensor.detach().to(dtype=torch.float32)
+                            if tensor.dim() == 1:
+                                expert_loads = [float(v) for v in tensor.cpu().tolist()]
+                            else:
+                                reduced = tensor.reshape(-1, tensor.shape[-1]).sum(dim=0)
+                                expert_loads = [float(v) for v in reduced.cpu().tolist()]
+                    module_load_cache[module_key] = expert_loads
+
+                expert_loads = module_load_cache.get(module_key, [])
+                if 0 <= int(local_expert_idx) < len(expert_loads):
+                    load_value = float(expert_loads[int(local_expert_idx)])
+
+            loads[tracker_idx] = load_value
+
+        return loads
+
+    def _update_moe_expert_token_load_stats(self) -> None:
+        if not self.track_expert_token_load:
+            return
+
+        current_loads = self._collect_current_expert_token_loads()
+        if not current_loads:
+            return
+
+        for tracker_idx, load_value in current_loads.items():
+            tracker = self.expert_shard_tracker[tracker_idx]
+            tracker["last_token_load"] = float(load_value)
+            tracker["token_load_accum"] = float(tracker.get("token_load_accum", 0.0) + load_value)
+
     @torch.no_grad()
     def step(self):
         """
@@ -869,6 +1227,8 @@ class CDCOptimizer(MegatronOptimizer):
         if update_successful:
             self.step_count += 1
             self._record_lr_wd_for_step()
+            if self.track_expert_token_load:
+                self._update_moe_expert_token_load_stats()
 
             # 2. Outer Step
             if self.algorithm == 'diloco':
@@ -891,7 +1251,7 @@ class CDCOptimizer(MegatronOptimizer):
         """Standard DiLoCo synchronization."""
         # Calculate pseudo-gradients: G = Original - Current
         all_grads = []
-        for snap_param, model_param in zip(self.original_snapshot, self.model_param_list):
+        for snap_param, model_param in zip(self.original_snapshot, self.tracked_model_param_list):
             if snap_param.grad is None:
                 snap_param.grad = torch.zeros_like(snap_param.data)
             model_data = model_param.data
@@ -914,7 +1274,7 @@ class CDCOptimizer(MegatronOptimizer):
                 snap_param.grad = None
 
         # Copy back to current model parameters
-        for updated_param, curr_param in zip(self.original_snapshot, self.model_param_list):
+        for updated_param, curr_param in zip(self.original_snapshot, self.tracked_model_param_list):
             curr_param.copy_(updated_param.to(device=curr_param.device, dtype=curr_param.dtype))
 
         # Keep optimizer main params in sync with model params for mixed precision.
@@ -923,26 +1283,123 @@ class CDCOptimizer(MegatronOptimizer):
         
     def _sync_streaming(self):
         """Unified synchronization step for Streaming and DC."""
-        # Check for pending receives
-        for shard_idx, tracker in self.shard_tracker.items():
-            if tracker["next_receive_step"] > 0 and self.step_count >= tracker["next_receive_step"]:
-                self._complete_sync(shard_idx)
-                tracker["next_receive_step"] = 0 # Reset
-
-        # Check for new sends
-        # Unified logic: Every sync_interval steps, initiate a sync.
-        # Selection logic (Round-Robin vs Smart) is handled in _select_next_shard.
+        self._complete_due_tracker_syncs(self.shard_tracker, tracker_kind='dense-shard')
+        if self.enable_moe_expert_refresh:
+            self._complete_due_expert_syncs_batched()
 
         if self.step_count % self.sync_interval == 0:
             shard_idx = self._select_next_shard()
-            self._initiate_sync(shard_idx)
+            self._initiate_tracker_sync(
+                self.shard_tracker, shard_idx, tracker_kind='dense-shard'
+            )
+            return
+
+        if self._should_sync_expert_group():
+            expert_group_indices = self._select_next_expert_groups()
+            if expert_group_indices:
+                expert_event_index = self.expert_sync_event_count + 1
+                batch_immediate_completion = self.delay == 0 and len(expert_group_indices) > 1
+                for expert_group_idx in expert_group_indices:
+                    self._initiate_tracker_sync(
+                        self.expert_shard_tracker,
+                        expert_group_idx,
+                        tracker_kind='expert-group',
+                        expert_event_index=expert_event_index,
+                        defer_completion=batch_immediate_completion,
+                    )
+                self.expert_sync_event_count = expert_event_index
+                if batch_immediate_completion:
+                    self._complete_tracker_sync_batch(
+                        self.expert_shard_tracker,
+                        expert_group_indices,
+                        tracker_kind='expert-group',
+                    )
+                    for expert_group_idx in expert_group_indices:
+                        self.expert_shard_tracker[expert_group_idx]["next_receive_step"] = 0
+
+    def _complete_due_expert_syncs_batched(self) -> None:
+        if not getattr(self, "expert_shard_tracker", None):
+            return
+
+        due_event_to_trackers: Dict[int, List[int]] = {}
+        for tracker_idx, tracker in self.expert_shard_tracker.items():
+            next_receive_step = int(tracker.get("next_receive_step", 0))
+            if next_receive_step <= 0 or self.step_count < next_receive_step:
+                continue
+
+            event_id = int(tracker.get("sent_at_expert_event", 0))
+            if event_id <= 0:
+                event_id = -(tracker_idx + 1)
+            due_event_to_trackers.setdefault(event_id, []).append(tracker_idx)
+
+        for event_id in sorted(due_event_to_trackers.keys()):
+            tracker_indices = sorted(due_event_to_trackers[event_id])
+            if len(tracker_indices) == 1:
+                self._complete_tracker_sync(
+                    self.expert_shard_tracker,
+                    tracker_indices[0],
+                    tracker_kind='expert-group',
+                    reload_main_params=False,
+                )
+                if self.mixed_precision:
+                    self.inner_optimizer.reload_model_params()
+            else:
+                self._complete_tracker_sync_batch(
+                    self.expert_shard_tracker,
+                    tracker_indices,
+                    tracker_kind='expert-group',
+                )
+
+            for tracker_idx in tracker_indices:
+                self.expert_shard_tracker[tracker_idx]["next_receive_step"] = 0
+
+    def _complete_due_tracker_syncs(
+        self, tracker_dict: Optional[Dict[int, Dict[str, Any]]], *, tracker_kind: str
+    ) -> None:
+        if not tracker_dict:
+            return
+
+        for tracker_idx, tracker in tracker_dict.items():
+            if tracker["next_receive_step"] > 0 and self.step_count >= tracker["next_receive_step"]:
+                self._complete_tracker_sync(
+                    tracker_dict, tracker_idx, tracker_kind=tracker_kind
+                )
+                tracker["next_receive_step"] = 0
+
+    def _next_nonempty_tracker_index(
+        self, tracker_dict: Dict[int, Dict[str, Any]], start_idx: int
+    ) -> Optional[int]:
+        if not tracker_dict:
+            return None
+        tracker_count = len(tracker_dict)
+        if tracker_count <= 0:
+            return None
+
+        for offset in range(tracker_count):
+            idx = (start_idx + offset) % tracker_count
+            tracker = tracker_dict[idx]
+            if self._tracker_has_any_params(tracker):
+                return idx
+        return None
+
+    def _should_sync_expert_group(self) -> bool:
+        if not self.enable_moe_expert_refresh:
+            return False
+        if not getattr(self, "expert_shard_tracker", None):
+            return False
+        if self.expert_sync_interval <= 0:
+            return False
+        shifted_step = self.step_count - self.expert_sync_offset
+        return shifted_step >= 0 and shifted_step % self.expert_sync_interval == 0
 
     def _select_next_shard(self):
         """Select the next shard to sync based on staleness and gradient norm."""
         # Streaming: Simple Round-Robin
         if self.algorithm == 'streaming':
-            idx = self.next_shard_idx
-            self.next_shard_idx = (self.next_shard_idx + 1) % self.num_shards
+            idx = self._next_nonempty_tracker_index(self.shard_tracker, self.next_shard_idx)
+            if idx is None:
+                return 0
+            self.next_shard_idx = (idx + 1) % self.num_shards
             return idx
 
         # DC: Smart Selection
@@ -989,18 +1446,170 @@ class CDCOptimizer(MegatronOptimizer):
         selected_idx = max(scores, key=scores.get)
         return selected_idx
 
-    def _initiate_sync(self, shard_idx):
-        """Start the sync process for a shard (Snapshot & Send)."""
-        tracker = self.shard_tracker[shard_idx]
+    def _expert_tracker_is_available(self, tracker: Dict[str, Any]) -> bool:
+        if not self._tracker_has_any_params(tracker):
+            return False
+        if tracker.get("next_receive_step", 0) > self.step_count:
+            return False
+        return True
 
-        # Calculate shard size for logging
+    def _collect_round_robin_expert_indices(
+        self,
+        *,
+        limit: int,
+        selected: Optional[set] = None,
+        require_unsent: bool = False,
+    ) -> List[int]:
+        if not self.expert_shard_tracker or limit <= 0:
+            return []
+
+        tracker_count = len(self.expert_shard_tracker)
+        selected = selected or set()
+        chosen: List[int] = []
+
+        for offset in range(tracker_count):
+            idx = (self.next_expert_group_idx + offset) % tracker_count
+            if idx in selected or idx in chosen:
+                continue
+            tracker = self.expert_shard_tracker[idx]
+            if not self._expert_tracker_is_available(tracker):
+                continue
+            if require_unsent and tracker.get("sent_at_expert_event", 0) > 0:
+                continue
+            chosen.append(idx)
+            if len(chosen) >= limit:
+                break
+
+        if chosen:
+            self.next_expert_group_idx = (chosen[-1] + 1) % tracker_count
+        return chosen
+
+    def _build_expert_score_map(self, candidate_indices: List[int]) -> Dict[int, float]:
+        if not candidate_indices:
+            return {}
+
+        update_scores: Dict[int, float] = {}
+        token_scores_local: Dict[int, float] = {}
+        for idx in candidate_indices:
+            tracker = self.expert_shard_tracker[idx]
+            denom = tracker["global_num_params"] if tracker["global_num_params"] > 0 else 1
+            update_scores[idx] = math.sqrt(max(float(tracker["last_score"]), 0.0) / denom)
+            token_scores_local[idx] = max(float(tracker.get("token_load_accum", 0.0)), 0.0)
+
+        if self.expert_score_mode == 'update_norm':
+            return update_scores
+
+        ordered_indices = sorted(candidate_indices)
+        reduced_token_values = self._all_reduce_vector_sum(
+            [token_scores_local[idx] for idx in ordered_indices], group=self.cdc_group
+        )
+        token_scores = {
+            idx: value for idx, value in zip(ordered_indices, reduced_token_values)
+        }
+
+        if self.expert_score_mode == 'token_load':
+            return token_scores
+
+        update_max = max(update_scores.values(), default=0.0)
+        token_max = max(token_scores.values(), default=0.0)
+        combined_scores: Dict[int, float] = {}
+        for idx in candidate_indices:
+            update_component = update_scores[idx] / update_max if update_max > 0.0 else 0.0
+            token_component = token_scores[idx] / token_max if token_max > 0.0 else 0.0
+            combined_scores[idx] = 0.5 * update_component + 0.5 * token_component
+        return combined_scores
+
+    def _select_next_expert_groups(self) -> List[int]:
+        if not self.expert_shard_tracker:
+            return []
+
+        candidate_indices = [
+            idx
+            for idx, tracker in self.expert_shard_tracker.items()
+            if self._expert_tracker_is_available(tracker)
+        ]
+        if not candidate_indices:
+            return []
+
+        max_select = min(self.expert_topk, len(candidate_indices))
+        selected: List[int] = []
+        selected_set = set()
+        upcoming_event = self.expert_sync_event_count + 1
+
+        stale_candidates: List[Tuple[int, int, int]] = []
+        for idx in candidate_indices:
+            tracker = self.expert_shard_tracker[idx]
+            sent_event = int(tracker.get("sent_at_expert_event", 0))
+            sent_step = int(tracker.get("sent_at_step", 0))
+            age_slots = (upcoming_event - sent_event) if sent_event > 0 else 0
+            age_steps = (self.step_count - sent_step) if sent_step > 0 else 0
+
+            slot_stale = self.expert_max_age_slots > 0 and sent_event > 0 and age_slots >= self.expert_max_age_slots
+            step_stale = self.expert_max_staleness > 0 and sent_step > 0 and age_steps >= self.expert_max_staleness
+            if slot_stale or step_stale:
+                stale_candidates.append((age_slots, age_steps, idx))
+
+        if stale_candidates:
+            stale_candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+            for _, _, idx in stale_candidates[:max_select]:
+                selected.append(idx)
+                selected_set.add(idx)
+
+        remaining = max_select - len(selected)
+        if remaining > 0:
+            unsent = self._collect_round_robin_expert_indices(
+                limit=remaining,
+                selected=selected_set,
+                require_unsent=True,
+            )
+            for idx in unsent:
+                selected.append(idx)
+                selected_set.add(idx)
+
+        remaining = max_select - len(selected)
+        if remaining <= 0:
+            return selected
+
+        if self.expert_selection == 'round_robin':
+            selected.extend(
+                self._collect_round_robin_expert_indices(
+                    limit=remaining,
+                    selected=selected_set,
+                    require_unsent=False,
+                )
+            )
+            return selected
+
+        score_candidates = [idx for idx in candidate_indices if idx not in selected_set]
+        score_map = self._build_expert_score_map(score_candidates)
+        ranked = sorted(score_candidates, key=lambda idx: (-score_map.get(idx, 0.0), idx))
+        selected.extend(ranked[:remaining])
+        return selected
+
+    def _initiate_tracker_sync(
+        self,
+        tracker_dict: Dict[int, Dict[str, Any]],
+        tracker_idx: int,
+        *,
+        tracker_kind: str,
+        expert_event_index: Optional[int] = None,
+        defer_completion: bool = False,
+    ) -> None:
+        """Start the sync process for a tracker entry (snapshot & send)."""
+        tracker = tracker_dict[tracker_idx]
+        tracker_label = tracker.get("display_name", str(tracker_idx))
+
+        # Calculate payload size for logging.
         total_bytes = 0
         for p in tracker["param_refs"]:
             total_bytes += p.numel() * p.element_size()
         size_mb = total_bytes / (1024 * 1024)
 
         if self.verbose:
-            print_rank_0(f"[CDC] Step {self.step_count}: Initiating sync for shard {shard_idx} (Size: {size_mb:.2f} MB).")
+            print_rank_0(
+                f"[CDC] Step {self.step_count}: Initiating sync for {tracker_kind} "
+                f"{tracker_label} (Size: {size_mb:.2f} MB)."
+            )
 
         tracker["sync_start_time"] = time.time()
 
@@ -1011,18 +1620,32 @@ class CDCOptimizer(MegatronOptimizer):
         tracker["old_sent_at_step"] = tracker["sent_at_step"]
         tracker["sent_at_step"] = self.step_count
         tracker["sent_wd_log_cumsums"] = self._snapshot_sent_wd_log_cumsums(tracker)
+        if tracker_kind == 'expert-group':
+            if expert_event_index is not None:
+                tracker["sent_at_expert_event"] = int(expert_event_index)
+            tracker["token_load_accum"] = 0.0
 
         # Schedule receive
         tracker["next_receive_step"] = self.step_count + self.delay
 
         # If delay is 0, complete immediately (synchronous)
-        if self.delay == 0:
-            self._complete_sync(shard_idx)
+        if self.delay == 0 and not defer_completion:
+            self._complete_tracker_sync(
+                tracker_dict, tracker_idx, tracker_kind=tracker_kind
+            )
             tracker["next_receive_step"] = 0
 
-    def _complete_sync(self, shard_idx):
-        """Complete the sync process (Receive & Update)."""
-        tracker = self.shard_tracker[shard_idx]
+    def _complete_tracker_sync(
+        self,
+        tracker_dict: Dict[int, Dict[str, Any]],
+        tracker_idx: int,
+        *,
+        tracker_kind: str,
+        reload_main_params: bool = True,
+    ) -> None:
+        """Complete the sync process for a tracker entry (receive & update)."""
+        tracker = tracker_dict[tracker_idx]
+        tracker_label = tracker.get("display_name", str(tracker_idx))
         param_refs = tracker["param_refs"]
         global_params = tracker["params"]
         staged_params = tracker["staged_params"]
@@ -1061,7 +1684,10 @@ class CDCOptimizer(MegatronOptimizer):
 
         if self.verbose:
             duration = time.time() - tracker.get("sync_start_time", time.time())
-            print_rank_0(f"[CDC] Step {self.step_count}: Completed sync for shard {shard_idx} in {duration:.4f}s. Score (Norm^2): {total_norm_sq:.4e}")
+            print_rank_0(
+                f"[CDC] Step {self.step_count}: Completed sync for {tracker_kind} "
+                f"{tracker_label} in {duration:.4f}s. Score (Norm^2): {total_norm_sq:.4e}"
+            )
 
         # 4. Outer Optimizer Step (Update Global)
         if tracker["outer_optimizer"]:
@@ -1078,10 +1704,10 @@ class CDCOptimizer(MegatronOptimizer):
                 p_global.data.sub_(avg_delta)
 
         # 5. Update Local Params (Algorithm Specific)
-        if self.algorithm == 'dc':
+        if self.algorithm == 'dc' and tracker_kind == 'dense-shard':
             self.delay_compensation(tracker)
 
-        elif self.algorithm == 'streaming':
+        else:
             # Alpha Blending
             for p_local, p_global in zip(param_refs, global_params):
                 p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
@@ -1093,6 +1719,90 @@ class CDCOptimizer(MegatronOptimizer):
                 p_local.data.copy_(blended.to(dtype=p_local.dtype))
 
         # Keep optimizer main params in sync with model params for mixed precision.
+        if self.mixed_precision and reload_main_params:
+            self.inner_optimizer.reload_model_params()
+
+    def _complete_tracker_sync_batch(
+        self,
+        tracker_dict: Dict[int, Dict[str, Any]],
+        tracker_indices: List[int],
+        *,
+        tracker_kind: str,
+    ) -> None:
+        if not tracker_indices:
+            return
+
+        tracker_entries: List[Tuple[Dict[str, Any], List[torch.nn.Parameter], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]] = []
+        batched_sync_grads: List[torch.Tensor] = []
+
+        for tracker_idx in tracker_indices:
+            tracker = tracker_dict[tracker_idx]
+            param_refs = tracker["param_refs"]
+            global_params = tracker["params"]
+            staged_params = tracker["staged_params"]
+
+            sync_grads: List[torch.Tensor] = []
+            for p_global, p_staged in zip(global_params, staged_params):
+                grad_tensor = p_global.data.clone()
+                grad_tensor.sub_(p_staged.data)
+                sync_grads.append(grad_tensor)
+            tracker_entries.append((tracker, param_refs, global_params, staged_params, sync_grads))
+            batched_sync_grads.extend(sync_grads)
+
+        self._all_reduce_flattened(
+            batched_sync_grads, communication_dtype=self.outer_comm_dtype
+        )
+
+        tp_group = mpu.get_tensor_model_parallel_group()
+        pp_group = mpu.get_pipeline_model_parallel_group()
+
+        for tracker, param_refs, global_params, _, sync_grads in tracker_entries:
+            tracker_label = tracker.get("display_name", "unknown")
+
+            total_norm_sq = 0.0
+            for grad_tensor in sync_grads:
+                total_norm_sq += float(grad_tensor.float().pow(2).sum().item())
+
+            if tp_group is not None and dist.get_world_size(group=tp_group) > 1:
+                norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
+                dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=tp_group)
+                total_norm_sq = norm_tensor.item()
+
+            if pp_group is not None and dist.get_world_size(group=pp_group) > 1:
+                norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
+                dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=pp_group)
+                total_norm_sq = norm_tensor.item()
+
+            tracker["last_score"] = total_norm_sq
+
+            if self.verbose:
+                duration = time.time() - tracker.get("sync_start_time", time.time())
+                print_rank_0(
+                    f"[CDC] Step {self.step_count}: Completed sync for {tracker_kind} "
+                    f"{tracker_label} in {duration:.4f}s. Score (Norm^2): {total_norm_sq:.4e}"
+                )
+
+            if tracker["outer_optimizer"]:
+                if len(global_params) > 0:
+                    for p_global, avg_delta in zip(global_params, sync_grads):
+                        if p_global.grad is None:
+                            p_global.grad = torch.zeros_like(p_global.data)
+                        p_global.grad.copy_(avg_delta)
+                    tracker["outer_optimizer"].step()
+                    tracker["outer_optimizer"].zero_grad(set_to_none=True)
+            else:
+                for p_global, avg_delta in zip(global_params, sync_grads):
+                    p_global.data.sub_(avg_delta)
+
+            for p_local, p_global in zip(param_refs, global_params):
+                p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
+                blended = (
+                    p_local.data.to(torch.float32).mul(self.streaming_alpha).add_(
+                        p_global_data, alpha=1.0 - self.streaming_alpha
+                    )
+                )
+                p_local.data.copy_(blended.to(dtype=p_local.dtype))
+
         if self.mixed_precision:
             self.inner_optimizer.reload_model_params()
             

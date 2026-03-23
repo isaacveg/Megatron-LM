@@ -1,0 +1,10 @@
+run_name,variant,seed,train_iters,cdc_algorithm,cdc_param_mode,cdc_sync_interval,cdc_num_shards,cdc_alpha,final_train_iter,final_train_loss,last_eval_iter,last_eval_loss,last_eval_ppl,avg_iter_ms,last_iter_ms,avg_cdc_comm_mb,avg_cdc_comm_s,max_cdc_comm_mb,max_memory_gb,notes
+smoke_moe1b_diloco_baseline_20260320_222839,smoke_diloco_baseline,,12,diloco,all,5,,,12,7.880567,12,7.846097,2555.739,11097.191666666668,5851.0,1983.25,8.2438,1983.25,,
+moe1b_diloco_baseline_5000_seed42_20260320_223604,diloco_baseline_5000,42,5000,diloco,all,100,,,5000,3.07683,5000,3.082375,21.81013,8703.8528,7331.9,1983.25,32.136356,1983.25,,
+smoke_moe1b_dense_cdc_20260321_150042,smoke_dense_only_cdc,42,20,streaming,dense-only,10,10,0.5,20,7.50654,20,7.488702,1787.73,6224.01,6410.4,65.39833333333333,0.2625166666666667,93.75,,
+moe1b_dense_cdc_5000_seed42_20260321_150457,dense_only_cdc_5000,42,5000,streaming,dense-only,10,10,0.5,5000,3.049293,5000,3.052024,21.15813,5799.2414,5709.8,59.728,0.37618607843137253,93.75,,
+smoke_moe1b_hybrid_expert_cdc_20260321_235225,smoke_hybrid_expert_cdc,42,30,streaming,dense-expert-hybrid,10,10,0.5,30,7.504145,30,7.471257,1756.813,5794.9,6138.1,32.09612903225807,0.11944193548387097,93.75,,
+moe1b_hybrid_expert_cdc_5000_seed42_resume2000_20260322_142505,hybrid_expert_cdc_5000_resume2000,42,5000,streaming,dense-expert-hybrid,10,10,0.5,5000,3.057364,5000,3.063875,21.41037,5893.367,5719.7,45.76391472868217,0.1720765503875969,93.75,,resumed_from_2000
+smoke_moe1b_streaming_baseline_20260322_201246,smoke_streaming_baseline,42,18,streaming,all,12,8,0.5,18,7.533634,18,7.506925,1820.607,6348.205555555555,5537.2,230.7788888888889,0.9593333333333334,465.81,,
+moe1b_streaming_baseline_5000_seed42_20260322_201831,streaming_baseline_5000,42,5000,streaming,all,12,8,0.5,5000,3.041546,5000,3.044737,21.0045,5959.5344000000005,5864.2,247.90750000000003,0.9115481132075471,465.81,,
+smoke_moe1b_hybrid_rr_topk2_20260323_144032,smoke_hybrid_rr_topk2,42,14,streaming,dense-expert-hybrid,10,10,0.5,14,7.677927,14,7.654804,2110.762,10074.585714285715,5482.5,30.333733333333335,0.139016,93.75,,

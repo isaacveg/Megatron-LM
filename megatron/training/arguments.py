@@ -2730,6 +2730,34 @@ def _add_cdc_args(parser):
     group.add_argument('--cdc-shard-pattern', type=str, default='sequential',
                        choices=['sequential', 'stride'],
                        help='Layer sharding pattern across CDC shards.')
+    group.add_argument('--cdc-moe-param-mode', type=str, default='all',
+                       choices=['all', 'dense-only', 'dense-expert-hybrid'],
+                       help='MoE-aware CDC parameter policy. "all" syncs all trainable parameters. '
+                            '"dense-only" excludes routed expert parameters from CDC while keeping '
+                            'dense weights, routers, and shared experts in CDC. '
+                            '"dense-expert-hybrid" keeps dense weights on the normal rolling CDC '
+                            'schedule and adds a second low-frequency routed-expert refresh queue.')
+    group.add_argument('--cdc-moe-expert-sync-interval', type=int, default=0,
+                       help='For dense-expert-hybrid: successful-step interval between routed-expert sync slots. '
+                            '0 disables the expert refresh queue.')
+    group.add_argument('--cdc-moe-expert-sync-offset', type=int, default=0,
+                       help='For dense-expert-hybrid: successful-step offset for expert sync slots. '
+                            'Use a non-zero offset to avoid colliding with dense sync slots.')
+    group.add_argument('--cdc-moe-expert-selection', type=str, default='score',
+                       choices=['round_robin', 'score'],
+                       help='For dense-expert-hybrid: routed-expert selection policy.')
+    group.add_argument('--cdc-moe-expert-topk', type=int, default=1,
+                       help='For dense-expert-hybrid: number of routed expert groups to sync in each expert slot.')
+    group.add_argument('--cdc-moe-expert-score-mode', type=str, default='update_norm',
+                       choices=['update_norm', 'token_load', 'mixed'],
+                       help='For dense-expert-hybrid with selection=score: scoring metric used to rank '
+                            'routed expert groups.')
+    group.add_argument('--cdc-moe-expert-max-age-slots', type=int, default=0,
+                       help='For dense-expert-hybrid: max staleness in expert-sync slots before a routed '
+                            'expert group is forced to sync. 0 disables slot-based age capping.')
+    group.add_argument('--cdc-moe-expert-max-staleness', type=int, default=0,
+                       help='For dense-expert-hybrid: max successful-step staleness before a routed expert '
+                            'group is forced to sync. 0 disables the step-based fallback cap.')
     group.add_argument('--cdc-verbose', action='store_true',
                        help='Enable verbose logging for CDC optimizer.')
 

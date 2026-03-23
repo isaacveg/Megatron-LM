@@ -1,0 +1,49 @@
+{
+  "runs": [
+    {
+      "series_id": "diloco_baseline",
+      "label": "DiLoCo Full Sync",
+      "variant": "diloco_baseline_5000",
+      "segments": [
+        {
+          "log_path": "/data/yzhu/megatron-lm-moe-exp/logs/moe1b_diloco_baseline_5000_seed42_20260320_223604.log"
+        }
+      ]
+    },
+    {
+      "series_id": "dense_only_cdc",
+      "label": "Dense-Only CDC",
+      "variant": "dense_only_cdc_5000",
+      "segments": [
+        {
+          "log_path": "/data/yzhu/megatron-lm-moe-exp/logs/moe1b_dense_cdc_5000_seed42_20260321_150457.log"
+        }
+      ]
+    },
+    {
+      "series_id": "hybrid_expert_cdc",
+      "label": "Dense+Expert Hybrid",
+      "variant": "hybrid_expert_cdc_5000_resume2000",
+      "segments": [
+        {
+          "log_path": "/data/yzhu/megatron-lm-moe-exp/logs/moe1b_hybrid_expert_cdc_5000_seed42_20260321_235803.log",
+          "max_iteration": 2000
+        },
+        {
+          "log_path": "/data/yzhu/megatron-lm-moe-exp/logs/moe1b_hybrid_expert_cdc_5000_seed42_resume2000_20260322_142505.log",
+          "min_iteration": 2010
+        }
+      ]
+    },
+    {
+      "series_id": "streaming_baseline",
+      "label": "Streaming DiLoCo Baseline",
+      "variant": "streaming_baseline_5000",
+      "segments": [
+        {
+          "log_path": "/data/yzhu/megatron-lm-moe-exp/logs/moe1b_streaming_baseline_5000_seed42_20260322_201831.log"
+        }
+      ]
+    }
+  ]
+}
