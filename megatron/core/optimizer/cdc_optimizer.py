@@ -38,29 +38,27 @@ class CDCOptimizer(MegatronOptimizer):
         self.tie_embeddings = not args.untie_embeddings_and_output_weights
         # assert args.untie_embeddings_and_output_weights, "CDC does not support tied embeddings and output weights."
         self.cdc_group = mpu.get_cdc_parallel_group()
-        self.sync_interval = getattr(args, 'cdc_sync_interval', getattr(args, 'diloco_sync_interval', 100))
+        self.sync_interval = args.cdc_sync_interval
         self.step_count = 0
-        self.algorithm = getattr(args, 'cdc_algorithm', getattr(args, 'diloco_algorithm', 'diloco'))
-        self.offload_outer_opt = getattr(args, 'cdc_offload_outer_opt', getattr(args, 'diloco_offload_outer_opt', False))
-        self.outer_lr = getattr(args, 'cdc_outer_lr', getattr(args, 'diloco_outer_lr', 1.0))
-        self.num_shards = getattr(args, 'cdc_num_shards', getattr(args, 'diloco_num_shards', 1))
-        self.dc_lambda = getattr(args, 'cdc_dc_lambda', getattr(args, 'diloco_dc_lambda', 2.0))
-        self.streaming_alpha = getattr(args, 'cdc_streaming_alpha', getattr(args, 'diloco_streaming_alpha', 0.5))
-        self.delay = getattr(args, 'cdc_delay', getattr(args, 'diloco_delay', 0))
-        self.dc_N = getattr(args, 'cdc_dc_N', getattr(args, 'diloco_dc_N', 4))
-        self.shard_pattern = getattr(args, 'cdc_shard_pattern', 'stride')
-        self.moe_param_mode = str(getattr(args, 'cdc_moe_param_mode', 'all')).lower()
-        self.expert_sync_interval = int(getattr(args, 'cdc_moe_expert_sync_interval', 0))
-        self.expert_sync_offset = int(getattr(args, 'cdc_moe_expert_sync_offset', 0))
-        self.expert_selection = str(getattr(args, 'cdc_moe_expert_selection', 'score')).lower()
-        self.expert_topk = int(getattr(args, 'cdc_moe_expert_topk', 1))
-        self.expert_score_mode = str(
-            getattr(args, 'cdc_moe_expert_score_mode', 'update_norm')
-        ).lower()
-        self.expert_max_age_slots = int(getattr(args, 'cdc_moe_expert_max_age_slots', 0))
-        self.expert_max_staleness = int(getattr(args, 'cdc_moe_expert_max_staleness', 0))
-        self.verbose = getattr(args, 'cdc_verbose', False)
-        self.mixed_precision = getattr(args, 'bf16', False) or getattr(args, 'fp16', False)
+        self.algorithm = args.cdc_algorithm
+        self.offload_outer_opt = args.cdc_offload_outer_opt
+        self.outer_lr = args.cdc_outer_lr
+        self.num_shards = args.cdc_num_shards
+        self.dc_lambda = args.cdc_dc_lambda
+        self.streaming_alpha = args.cdc_streaming_alpha
+        self.delay = args.cdc_delay
+        self.dc_N = args.cdc_dc_N
+        self.shard_pattern = args.cdc_shard_pattern
+        self.moe_param_mode = str(args.cdc_moe_param_mode).lower()
+        self.expert_sync_interval = int(args.cdc_moe_expert_sync_interval)
+        self.expert_sync_offset = int(args.cdc_moe_expert_sync_offset)
+        self.expert_selection = str(args.cdc_moe_expert_selection).lower()
+        self.expert_topk = int(args.cdc_moe_expert_topk)
+        self.expert_score_mode = str(args.cdc_moe_expert_score_mode).lower()
+        self.expert_max_age_slots = int(args.cdc_moe_expert_max_age_slots)
+        self.expert_max_staleness = int(args.cdc_moe_expert_max_staleness)
+        self.verbose = args.cdc_verbose
+        self.mixed_precision = args.bf16 or args.fp16
         self._named_model_param_list = self._iter_named_trainable_params_unique(self.model_chunks)
         self._expert_named_model_params = self._collect_routed_expert_named_params(
             self._named_model_param_list
@@ -88,7 +86,7 @@ class CDCOptimizer(MegatronOptimizer):
             self.model_param_dtype if self.mixed_precision else self.outer_state_dtype
         )
         # DC specifics.
-        self.dc_type = str(getattr(args, "cdc_dc_type", "update")).lower()
+        self.dc_type = str(args.cdc_dc_type).lower()
         # Initialized for all algorithms so checkpoint/state construction does not fail.
         self.next_shard_idx = 0
         self.next_expert_group_idx = 0
@@ -110,7 +108,7 @@ class CDCOptimizer(MegatronOptimizer):
             raise ValueError(
                 f"Unknown cdc_moe_expert_score_mode: {self.expert_score_mode}"
             )
-        if self.enable_moe_expert_refresh and int(getattr(args, 'expert_model_parallel_size', 1)) != 1:
+        if self.enable_moe_expert_refresh and int(args.expert_model_parallel_size) != 1:
             raise NotImplementedError(
                 "dense-expert-hybrid currently supports expert_model_parallel_size=1 only."
             )
