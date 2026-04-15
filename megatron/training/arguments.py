@@ -2755,6 +2755,10 @@ def _add_cdc_args(parser):
     group.add_argument('--cdc-moe-expert-max-age-slots', type=int, default=0,
                        help='For dense-expert-hybrid: max staleness in expert-sync slots before a routed '
                             'expert group is forced to sync. 0 disables slot-based age capping.')
+    group.add_argument('--cdc-moe-expert-min-age-slots', type=int, default=5,
+                       help='For dense-expert-hybrid: minimum gap in expert-sync slots between two sends '
+                            'of the same routed expert group during normal score/RR selection. '
+                            'Mandatory first-send and stale-forced syncs ignore this bound. 0 disables it.')
     group.add_argument('--cdc-moe-expert-max-staleness', type=int, default=0,
                        help='For dense-expert-hybrid: max successful-step staleness before a routed expert '
                             'group is forced to sync. 0 disables the step-based fallback cap.')
