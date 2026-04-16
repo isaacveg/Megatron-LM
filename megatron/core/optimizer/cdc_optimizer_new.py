@@ -64,6 +64,7 @@ class DiLoCoBranchState:
 @dataclass
 class StreamingBranchState:
     dense_trackers: Dict[int, TrackerSlot] = field(default_factory=dict)
+    router_trackers: Dict[int, TrackerSlot] = field(default_factory=dict)
     expert_trackers: Dict[int, TrackerSlot] = field(default_factory=dict)
     next_dense_slot: int = 0
     next_expert_slot: int = 0
@@ -130,14 +131,26 @@ class CDCOptimizerNew(MegatronOptimizer):
         self.expert_topk = int(args.cdc_moe_expert_topk)
         self.expert_score_mode = str(args.cdc_moe_expert_score_mode).lower()
         self.expert_max_age_slots = int(args.cdc_moe_expert_max_age_slots)
+        self.expert_min_age_slots = int(args.cdc_moe_expert_min_age_slots)
         self.expert_max_staleness = int(args.cdc_moe_expert_max_staleness)
 
         self.step_count = 0
         self._cdc_state_loaded = False
 
         self._named_model_param_list = self._iter_named_trainable_params_unique(self.model_chunks)
+        self._router_named_model_params = self._collect_router_named_params(
+            self._named_model_param_list
+        )
         self._local_expert_named_params = self._collect_local_routed_expert_named_params(
             self._named_model_param_list
+        )
+        self.enable_moe_expert_refresh = (
+            self.moe_param_mode == "dense-expert-hybrid" and self.expert_sync_interval > 0
+        )
+        self.enable_moe_router_refresh = (
+            self.moe_param_mode == "dense-expert-hybrid"
+            and self.algorithm == "streaming"
+            and len(self._router_named_model_params) > 0
         )
         self._tracked_named_model_params = self._filter_named_params_for_cdc(
             self._named_model_param_list
@@ -150,9 +163,6 @@ class CDCOptimizerNew(MegatronOptimizer):
             self.model_param_dtype if self.mixed_precision else self.outer_state_dtype
         )
 
-        self.enable_moe_expert_refresh = (
-            self.moe_param_mode == "dense-expert-hybrid" and self.expert_sync_interval > 0
-        )
         self.track_expert_token_load = (
             self.enable_moe_expert_refresh
             and self.expert_selection == "score"
@@ -180,8 +190,11 @@ class CDCOptimizerNew(MegatronOptimizer):
                 "[CDC-New] Initialized "
                 f"algorithm={self.algorithm}, sync_interval={self.sync_interval}, "
                 f"num_shards={self.num_shards}, delay={self.delay}, "
-                f"moe_param_mode={self.moe_param_mode}, expert_refresh={refresh_state}, "
+                f"moe_param_mode={self.moe_param_mode}, "
+                f"router_refresh={'every_dense_slot' if self.enable_moe_router_refresh else 'off'}, "
+                f"expert_refresh={refresh_state}, "
                 f"expert_topk={self.expert_topk}, expert_score_mode={self.expert_score_mode}, "
+                f"expert_min_age_slots={self.expert_min_age_slots}, "
                 f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}"
             )
 
@@ -332,6 +345,10 @@ class CDCOptimizerNew(MegatronOptimizer):
             raise ValueError(
                 f"cdc_moe_expert_sync_interval must be >= 0, got {self.expert_sync_interval}"
             )
+        if self.expert_min_age_slots < 0:
+            raise ValueError(
+                f"cdc_moe_expert_min_age_slots must be >= 0, got {self.expert_min_age_slots}"
+            )
         if self.expert_sync_offset < 0:
             raise ValueError(
                 f"cdc_moe_expert_sync_offset must be >= 0, got {self.expert_sync_offset}"
@@ -396,6 +413,10 @@ class CDCOptimizerNew(MegatronOptimizer):
         return ".experts." in param_name and ".shared_experts." not in param_name
 
     @staticmethod
+    def _is_moe_router_param_name(param_name: str) -> bool:
+        return ".router." in param_name
+
+    @staticmethod
     def _routed_expert_group_key(param_name: str) -> Optional[str]:
         match = re.search(r"(.*?\.experts\.local_experts\.\d+)\.", param_name)
         if match is None:
@@ -411,6 +432,15 @@ class CDCOptimizerNew(MegatronOptimizer):
             if self._is_routed_expert_param_name(name)
         ]
 
+    def _collect_router_named_params(
+        self, named_params: List[Tuple[str, torch.nn.Parameter]]
+    ) -> List[Tuple[str, torch.nn.Parameter]]:
+        return [
+            (name, param)
+            for name, param in named_params
+            if self._is_moe_router_param_name(name)
+        ]
+
     def _filter_named_params_for_cdc(
         self, named_params: List[Tuple[str, torch.nn.Parameter]]
     ) -> List[Tuple[str, torch.nn.Parameter]]:
@@ -420,10 +450,16 @@ class CDCOptimizerNew(MegatronOptimizer):
         tracked: List[Tuple[str, torch.nn.Parameter]] = []
         excluded_tensors = 0
         excluded_numel = 0
+        router_tensors = 0
+        router_numel = 0
         for name, param in named_params:
             if self._is_routed_expert_param_name(name):
                 excluded_tensors += 1
                 excluded_numel += param.numel()
+                continue
+            if self.enable_moe_router_refresh and self._is_moe_router_param_name(name):
+                router_tensors += 1
+                router_numel += param.numel()
                 continue
             tracked.append((name, param))
 
@@ -437,6 +473,7 @@ class CDCOptimizerNew(MegatronOptimizer):
             print_rank_0(
                 "[CDC-New] MoE mode filtered routed experts from dense queue: "
                 f"excluded_tensors={excluded_tensors}, excluded_params={excluded_numel}, "
+                f"router_dedicated={router_tensors} tensors/{router_numel} params, "
                 f"tracked_tensors={len(tracked)}, tracked_params={tracked_numel}"
             )
 
@@ -512,6 +549,49 @@ class CDCOptimizerNew(MegatronOptimizer):
             if hasattr(module, "token_dispatcher") and hasattr(module, "experts"):
                 module_index[normalized_name] = module
         return module_index
+
+    def _lookup_moe_module(self, module_key: str) -> Optional[torch.nn.Module]:
+        if not module_key:
+            return None
+        module = self._moe_module_index.get(module_key)
+        if module is not None:
+            return module
+
+        suffix_matches = [
+            candidate_module
+            for candidate_key, candidate_module in self._moe_module_index.items()
+            if candidate_key.endswith(module_key) or module_key.endswith(candidate_key)
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        return None
+
+    @staticmethod
+    def _tensor_like_to_float_list(value: Any) -> List[float]:
+        if value is None:
+            return []
+        if torch.is_tensor(value):
+            tensor = value.detach().to(dtype=torch.float32)
+            if tensor.dim() == 1:
+                return [float(v) for v in tensor.cpu().tolist()]
+            reduced = tensor.reshape(-1, tensor.shape[-1]).sum(dim=0)
+            return [float(v) for v in reduced.cpu().tolist()]
+        if isinstance(value, (list, tuple)):
+            return [float(v) for v in value]
+        if hasattr(value, "tolist"):
+            raw = value.tolist()
+            if isinstance(raw, list):
+                if raw and isinstance(raw[0], list):
+                    if not raw[0]:
+                        return []
+                    cols = len(raw[0])
+                    reduced = [0.0 for _ in range(cols)]
+                    for row in raw:
+                        for idx, item in enumerate(row):
+                            reduced[idx] += float(item)
+                    return reduced
+                return [float(v) for v in raw]
+        return []
 
     @staticmethod
     def _is_embedding_param_name(param_name: str) -> bool:
@@ -628,6 +708,22 @@ class CDCOptimizerNew(MegatronOptimizer):
                     f"global_numel={tracker.global_num_params}"
                 )
 
+        router_trackers: Dict[int, TrackerSlot] = {}
+        if self.enable_moe_router_refresh:
+            router_params = [param for _, param in self._router_named_model_params]
+            router_tracker = self._build_tracker(
+                slot_id=0,
+                display_name="moe-router",
+                param_refs=router_params,
+            )
+            router_trackers[0] = router_tracker
+            if self.verbose:
+                print_rank_0(
+                    "[CDC-New] Router tracker initialized: "
+                    f"local_tensors={len(router_tracker.param_refs)}, "
+                    f"global_numel={router_tracker.global_num_params}"
+                )
+
         expert_trackers: Dict[int, TrackerSlot] = {}
         if self.enable_moe_expert_refresh:
             global_expert_group_names = self._gather_unique_strings_across_group(
@@ -669,6 +765,7 @@ class CDCOptimizerNew(MegatronOptimizer):
 
         self.streaming_state = StreamingBranchState(
             dense_trackers=dense_trackers,
+            router_trackers=router_trackers,
             expert_trackers=expert_trackers,
             next_dense_slot=0,
             next_expert_slot=0,
@@ -804,6 +901,7 @@ class CDCOptimizerNew(MegatronOptimizer):
         assert self.streaming_state is not None
 
         self._complete_due_dense_syncs()
+        self._complete_due_router_syncs()
         if self.enable_moe_expert_refresh:
             self._complete_due_expert_syncs_batched()
 
@@ -813,6 +911,16 @@ class CDCOptimizerNew(MegatronOptimizer):
                 self.streaming_state.dense_trackers[dense_slot],
                 tracker_kind="dense-shard",
             )
+            if self.enable_moe_router_refresh:
+                router_tracker = self.streaming_state.router_trackers.get(0)
+                if router_tracker is not None and not router_tracker.is_in_flight(self.step_count):
+                    self._initiate_tracker_sync(router_tracker, tracker_kind="router")
+                elif self.verbose and router_tracker is not None:
+                    print_rank_0(
+                        "[CDC-New] Step "
+                        f"{self.step_count}: Skip router sync because previous router sync "
+                        f"is still in flight until step {router_tracker.next_receive_step}."
+                    )
             return
 
         if self._should_open_expert_slot():
@@ -842,6 +950,13 @@ class CDCOptimizerNew(MegatronOptimizer):
         for tracker in self.streaming_state.dense_trackers.values():
             if tracker.next_receive_step > 0 and self.step_count >= tracker.next_receive_step:
                 self._complete_tracker_sync(tracker, tracker_kind="dense-shard")
+                tracker.next_receive_step = 0
+
+    def _complete_due_router_syncs(self) -> None:
+        assert self.streaming_state is not None
+        for tracker in self.streaming_state.router_trackers.values():
+            if tracker.next_receive_step > 0 and self.step_count >= tracker.next_receive_step:
+                self._complete_tracker_sync(tracker, tracker_kind="router")
                 tracker.next_receive_step = 0
 
     def _complete_due_expert_syncs_batched(self) -> None:
@@ -878,6 +993,37 @@ class CDCOptimizerNew(MegatronOptimizer):
             return False
         shifted_step = self.step_count - self.expert_sync_offset
         return shifted_step >= 0 and shifted_step % self.expert_sync_interval == 0
+
+    @staticmethod
+    def _expert_slot_is_unsent(tracker: TrackerSlot) -> bool:
+        return tracker.sent_at_expert_event <= 0
+
+    def _expert_slot_age_slots(self, tracker: TrackerSlot, upcoming_event: int) -> int:
+        if self._expert_slot_is_unsent(tracker):
+            return 0
+        return int(upcoming_event - tracker.sent_at_expert_event)
+
+    def _expert_slot_age_steps(self, tracker: TrackerSlot) -> int:
+        if tracker.sent_at_step <= 0:
+            return 0
+        return int(self.step_count - tracker.sent_at_step)
+
+    def _expert_slot_is_slot_stale(self, tracker: TrackerSlot, upcoming_event: int) -> bool:
+        if self.expert_max_age_slots <= 0 or self._expert_slot_is_unsent(tracker):
+            return False
+        return self._expert_slot_age_slots(tracker, upcoming_event) >= self.expert_max_age_slots
+
+    def _expert_slot_is_step_stale(self, tracker: TrackerSlot) -> bool:
+        if self.expert_max_staleness <= 0 or self._expert_slot_is_unsent(tracker):
+            return False
+        return self._expert_slot_age_steps(tracker) >= self.expert_max_staleness
+
+    def _expert_slot_is_min_age_blocked(
+        self, tracker: TrackerSlot, upcoming_event: int
+    ) -> bool:
+        if self.expert_min_age_slots <= 0 or self._expert_slot_is_unsent(tracker):
+            return False
+        return self._expert_slot_age_slots(tracker, upcoming_event) < self.expert_min_age_slots
 
     # ------------------------------------------------------------------
     # Selection
@@ -944,37 +1090,32 @@ class CDCOptimizerNew(MegatronOptimizer):
         selected_set = set()
         upcoming_event = self.streaming_state.expert_sync_event_count + 1
 
+        unsent = self._collect_round_robin_expert_slots(
+            limit=limit, selected=selected_set, require_unsent=True
+        )
+        for slot_id in unsent:
+            selected.append(slot_id)
+            selected_set.add(slot_id)
+
+        remaining = limit - len(selected)
+        if remaining <= 0:
+            return selected
+
         stale_candidates: List[Tuple[int, int, int]] = []
         for slot_id in candidate_slots:
+            if slot_id in selected_set:
+                continue
             tracker = trackers[slot_id]
-            sent_event = tracker.sent_at_expert_event
-            sent_step = tracker.sent_at_step
-            age_slots = (upcoming_event - sent_event) if sent_event > 0 else 0
-            age_steps = (self.step_count - sent_step) if sent_step > 0 else 0
-
-            slot_stale = (
-                self.expert_max_age_slots > 0 and sent_event > 0 and age_slots >= self.expert_max_age_slots
-            )
-            step_stale = (
-                self.expert_max_staleness > 0
-                and sent_step > 0
-                and age_steps >= self.expert_max_staleness
-            )
+            age_slots = self._expert_slot_age_slots(tracker, upcoming_event)
+            age_steps = self._expert_slot_age_steps(tracker)
+            slot_stale = self._expert_slot_is_slot_stale(tracker, upcoming_event)
+            step_stale = self._expert_slot_is_step_stale(tracker)
             if slot_stale or step_stale:
                 stale_candidates.append((age_slots, age_steps, slot_id))
 
         if stale_candidates:
             stale_candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
-            for _, _, slot_id in stale_candidates[:limit]:
-                selected.append(slot_id)
-                selected_set.add(slot_id)
-
-        remaining = limit - len(selected)
-        if remaining > 0:
-            unsent = self._collect_round_robin_expert_slots(
-                limit=remaining, selected=selected_set, require_unsent=True
-            )
-            for slot_id in unsent:
+            for _, _, slot_id in stale_candidates[:remaining]:
                 selected.append(slot_id)
                 selected_set.add(slot_id)
 
@@ -982,15 +1123,25 @@ class CDCOptimizerNew(MegatronOptimizer):
         if remaining <= 0:
             return selected
 
+        regular_candidate_slots = {
+            slot_id
+            for slot_id in candidate_slots
+            if slot_id not in selected_set
+            and not self._expert_slot_is_min_age_blocked(trackers[slot_id], upcoming_event)
+        }
+
         if self.expert_selection == "round_robin":
             selected.extend(
                 self._collect_round_robin_expert_slots(
-                    limit=remaining, selected=selected_set, require_unsent=False
+                    limit=remaining,
+                    selected=selected_set,
+                    require_unsent=False,
+                    eligible_slots=regular_candidate_slots,
                 )
             )
             return selected
 
-        score_candidates = [slot_id for slot_id in candidate_slots if slot_id not in selected_set]
+        score_candidates = sorted(regular_candidate_slots)
         score_map = self._build_expert_score_map(score_candidates)
         ranked = sorted(score_candidates, key=lambda slot_id: (-score_map.get(slot_id, 0.0), slot_id))
         selected.extend(ranked[:remaining])
@@ -1002,6 +1153,7 @@ class CDCOptimizerNew(MegatronOptimizer):
         limit: int,
         selected: Optional[set] = None,
         require_unsent: bool,
+        eligible_slots: Optional[set] = None,
     ) -> List[int]:
         assert self.streaming_state is not None
         trackers = self.streaming_state.expert_trackers
@@ -1014,6 +1166,8 @@ class CDCOptimizerNew(MegatronOptimizer):
         for offset in range(tracker_count):
             slot_id = (self.streaming_state.next_expert_slot + offset) % tracker_count
             if slot_id in selected or slot_id in chosen:
+                continue
+            if eligible_slots is not None and slot_id not in eligible_slots:
                 continue
             tracker = trackers[slot_id]
             if not tracker.has_global_params() or tracker.is_in_flight(self.step_count):
@@ -1080,25 +1234,33 @@ class CDCOptimizerNew(MegatronOptimizer):
             load_value = 0.0
             if tracker.moe_module_key is not None and tracker.local_expert_idx is not None:
                 if tracker.moe_module_key not in module_load_cache:
-                    module = self._moe_module_index.get(tracker.moe_module_key)
+                    module = self._lookup_moe_module(tracker.moe_module_key)
                     expert_loads: List[float] = []
                     if module is not None:
                         token_dispatcher = getattr(module, "token_dispatcher", None)
                         load_tensor = None
                         if token_dispatcher is not None:
-                            load_tensor = getattr(
-                                token_dispatcher, "num_global_tokens_per_local_expert", None
-                            )
+                            local_map = getattr(token_dispatcher, "local_map", None)
+                            if torch.is_tensor(local_map):
+                                load_tensor = local_map.sum(dim=0)
+                            if load_tensor is None:
+                                load_tensor = getattr(
+                                    token_dispatcher, "num_global_tokens_per_local_expert", None
+                                )
+                            if load_tensor is None:
+                                load_tensor = getattr(
+                                    token_dispatcher, "num_global_tokens_per_local_expert_cpu", None
+                                )
                             if load_tensor is None:
                                 load_tensor = getattr(token_dispatcher, "tokens_per_expert", None)
+                            if load_tensor is None and hasattr(
+                                token_dispatcher, "get_number_of_tokens_per_expert"
+                            ):
+                                getter = getattr(token_dispatcher, "get_number_of_tokens_per_expert")
+                                if callable(getter):
+                                    load_tensor = getter()
 
-                        if torch.is_tensor(load_tensor):
-                            tensor = load_tensor.detach().to(dtype=torch.float32)
-                            if tensor.dim() == 1:
-                                expert_loads = [float(value) for value in tensor.cpu().tolist()]
-                            else:
-                                reduced = tensor.reshape(-1, tensor.shape[-1]).sum(dim=0)
-                                expert_loads = [float(value) for value in reduced.cpu().tolist()]
+                        expert_loads = self._tensor_like_to_float_list(load_tensor)
 
                     module_load_cache[tracker.moe_module_key] = expert_loads
 
@@ -1383,11 +1545,13 @@ class CDCOptimizerNew(MegatronOptimizer):
             state["diloco"] = self._serialize_diloco_state()
         else:
             assert self.streaming_state is not None
+            state["streaming_layout_version"] = 2
             state["streaming"] = {
                 "next_dense_slot": self.streaming_state.next_dense_slot,
                 "next_expert_slot": self.streaming_state.next_expert_slot,
                 "expert_sync_event_count": self.streaming_state.expert_sync_event_count,
                 "dense_trackers": self._serialize_tracker_map(self.streaming_state.dense_trackers),
+                "router_trackers": self._serialize_tracker_map(self.streaming_state.router_trackers),
                 "expert_trackers": self._serialize_tracker_map(self.streaming_state.expert_trackers),
             }
         return state
@@ -1458,6 +1622,13 @@ class CDCOptimizerNew(MegatronOptimizer):
             return
 
         assert self.streaming_state is not None
+        layout_version = int(state.get("streaming_layout_version", 1))
+        if self.enable_moe_router_refresh and layout_version < 2:
+            raise ValueError(
+                "This CDC checkpoint uses the legacy hybrid layout with router parameters "
+                "embedded in dense shards. The current implementation keeps routers in a "
+                "dedicated tracker, so resume from this CDC optimizer state is not supported."
+            )
         self.streaming_state.next_dense_slot = int(
             streaming_state.get("next_dense_slot", self.streaming_state.next_dense_slot)
         )
@@ -1471,6 +1642,9 @@ class CDCOptimizerNew(MegatronOptimizer):
         )
         self._load_tracker_map(
             self.streaming_state.dense_trackers, streaming_state.get("dense_trackers", [])
+        )
+        self._load_tracker_map(
+            self.streaming_state.router_trackers, streaming_state.get("router_trackers", [])
         )
         self._load_tracker_map(
             self.streaming_state.expert_trackers, streaming_state.get("expert_trackers", [])
@@ -1555,6 +1729,7 @@ class CDCOptimizerNew(MegatronOptimizer):
         self.streaming_state.next_expert_slot = 0
         self.streaming_state.expert_sync_event_count = 0
         self._reset_tracker_map_from_model(self.streaming_state.dense_trackers)
+        self._reset_tracker_map_from_model(self.streaming_state.router_trackers)
         self._reset_tracker_map_from_model(self.streaming_state.expert_trackers)
 
     def _reset_tracker_map_from_model(self, trackers: Dict[int, TrackerSlot]) -> None:
