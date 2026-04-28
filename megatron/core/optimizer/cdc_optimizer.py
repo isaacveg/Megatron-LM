@@ -46,6 +46,7 @@ class CDCOptimizer(MegatronOptimizer):
         self.num_shards = args.cdc_num_shards
         self.dc_lambda = args.cdc_dc_lambda
         self.streaming_alpha = args.cdc_streaming_alpha
+        self.router_alpha = float(args.cdc_moe_router_alpha)
         self.delay = args.cdc_delay
         self.dc_N = args.cdc_dc_N
         self.shard_pattern = args.cdc_shard_pattern
@@ -58,6 +59,7 @@ class CDCOptimizer(MegatronOptimizer):
         self.expert_max_age_slots = int(args.cdc_moe_expert_max_age_slots)
         self.expert_min_age_slots = int(args.cdc_moe_expert_min_age_slots)
         self.expert_max_staleness = int(args.cdc_moe_expert_max_staleness)
+        self.blocking_full_sync_steps = int(args.cdc_blocking_full_sync_steps)
         self.verbose = args.cdc_verbose
         self.mixed_precision = args.bf16 or args.fp16
         self._named_model_param_list = self._iter_named_trainable_params_unique(self.model_chunks)
@@ -75,11 +77,17 @@ class CDCOptimizer(MegatronOptimizer):
         self._tracked_named_model_params = self._filter_named_params_for_cdc(
             self._named_model_param_list
         )
-        self.enable_moe_expert_refresh = (
+        self.has_moe_expert_trackers = (
             self.moe_param_mode == 'dense-expert-hybrid'
             and self.algorithm == 'streaming'
             and len(self._expert_named_model_params) > 0
-            and self.expert_sync_interval > 0
+            and (
+                self.expert_sync_interval > 0
+                or self.blocking_full_sync_steps > 0
+            )
+        )
+        self.enable_moe_expert_refresh = (
+            self.has_moe_expert_trackers and self.expert_sync_interval > 0
         )
         self.track_expert_token_load = (
             self.enable_moe_expert_refresh
@@ -120,6 +128,12 @@ class CDCOptimizer(MegatronOptimizer):
             raise ValueError(
                 f"cdc_moe_expert_min_age_slots must be >= 0, got {self.expert_min_age_slots}"
             )
+        if self.blocking_full_sync_steps < 0:
+            raise ValueError(
+                f"cdc_blocking_full_sync_steps must be >= 0, got {self.blocking_full_sync_steps}"
+            )
+        if self.router_alpha > 1.0:
+            raise ValueError(f"cdc_moe_router_alpha must be <= 1.0, got {self.router_alpha}")
         if self.expert_selection not in {'round_robin', 'score'}:
             raise ValueError(
                 f"Unknown cdc_moe_expert_selection: {self.expert_selection}"
@@ -131,6 +145,11 @@ class CDCOptimizer(MegatronOptimizer):
         if self.enable_moe_expert_refresh and int(args.expert_model_parallel_size) != 1:
             raise NotImplementedError(
                 "dense-expert-hybrid currently supports expert_model_parallel_size=1 only."
+            )
+        if self.algorithm == 'diloco' and self.blocking_full_sync_steps > 0:
+            raise ValueError(
+                "cdc_blocking_full_sync_steps is only supported for streaming/DC CDC runs. "
+                "diloco already performs a blocking full sync via cdc_sync_interval."
             )
 
         self._moe_module_index = (
@@ -156,9 +175,11 @@ class CDCOptimizer(MegatronOptimizer):
                 f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}, "
                 f"moe_param_mode={self.moe_param_mode}, "
                 f"router_refresh={'every_dense_slot' if self.enable_moe_router_refresh else 'off'}, "
+                f"router_alpha={'inherit' if self.router_alpha < 0.0 else self.router_alpha}, "
                 f"expert_refresh={'on' if self.enable_moe_expert_refresh else 'off'}, "
                 f"expert_topk={self.expert_topk}, expert_score_mode={self.expert_score_mode}, "
-                f"expert_min_age_slots={self.expert_min_age_slots}"
+                f"expert_min_age_slots={self.expert_min_age_slots}, "
+                f"blocking_full_sync={'off' if self.blocking_full_sync_steps <= 0 else f'every_{self.blocking_full_sync_steps}_steps'}"
             )
         
         if self.algorithm == 'diloco':
@@ -856,6 +877,7 @@ class CDCOptimizer(MegatronOptimizer):
         display_name: str,
         moe_module_key: Optional[str] = None,
         local_expert_idx: Optional[int] = None,
+        comm_dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         param_group_indices = [
             self._get_param_group_index_for_model_param(p) for p in param_refs
@@ -872,6 +894,7 @@ class CDCOptimizer(MegatronOptimizer):
             "sent_wd_log_cumsums": None,
             "params": [],
             "staged_params": [],
+            "comm_dtype": comm_dtype if comm_dtype is not None else self.outer_comm_dtype,
             "sent_at_step": 0,
             "old_sent_at_step": 0,
             "next_receive_step": 0,
@@ -907,7 +930,8 @@ class CDCOptimizer(MegatronOptimizer):
 
         if len(tracker["params"]) > 0:
             self._all_reduce_flattened(
-                [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
+                [t.data for t in tracker["params"]],
+                communication_dtype=tracker["comm_dtype"],
             )
 
         return tracker
@@ -936,7 +960,8 @@ class CDCOptimizer(MegatronOptimizer):
 
             if tracker["params"]:
                 self._all_reduce_flattened(
-                    [t.data for t in tracker["params"]], communication_dtype=self.outer_comm_dtype
+                    [t.data for t in tracker["params"]],
+                    communication_dtype=tracker.get("comm_dtype", self.outer_comm_dtype),
                 )
 
     def _reset_outer_state_from_model(self) -> None:
@@ -1108,6 +1133,7 @@ class CDCOptimizer(MegatronOptimizer):
                 tp_group=tp_group,
                 pp_group=pp_group,
                 display_name="moe-router",
+                comm_dtype=torch.float32,
             )
             self.router_tracker[0] = router_tracker
 
@@ -1117,7 +1143,7 @@ class CDCOptimizer(MegatronOptimizer):
                     f"global_numel={router_tracker['global_num_params']}"
                 )
 
-        if self.enable_moe_expert_refresh:
+        if self.has_moe_expert_trackers:
             expert_groups = self._group_routed_expert_named_params()
             if not expert_groups:
                 raise ValueError(
@@ -1453,6 +1479,9 @@ class CDCOptimizer(MegatronOptimizer):
             self._complete_due_tracker_syncs(self.router_tracker, tracker_kind='router')
         if self.enable_moe_expert_refresh:
             self._complete_due_expert_syncs_batched()
+        if self._should_run_blocking_full_sync():
+            self._run_blocking_full_sync()
+            return
 
         if self.step_count % self.sync_interval == 0:
             shard_idx = self._select_next_shard()
@@ -1495,6 +1524,102 @@ class CDCOptimizer(MegatronOptimizer):
                     )
                     for expert_group_idx in expert_group_indices:
                         self.expert_shard_tracker[expert_group_idx]["next_receive_step"] = 0
+
+    @torch.no_grad()
+    def _run_blocking_full_sync(self) -> None:
+        dense_indices = [
+            idx
+            for idx, tracker in self.shard_tracker.items()
+            if self._tracker_has_any_params(tracker)
+        ]
+        router_indices = [
+            idx
+            for idx, tracker in getattr(self, "router_tracker", {}).items()
+            if self._tracker_has_any_params(tracker)
+        ]
+        expert_indices = [
+            idx
+            for idx, tracker in getattr(self, "expert_shard_tracker", {}).items()
+            if self._tracker_has_any_params(tracker)
+        ]
+
+        total_tracker_count = len(dense_indices) + len(router_indices) + len(expert_indices)
+        if total_tracker_count == 0:
+            return
+
+        start_time = time.time()
+        canceled = 0
+        canceled += self._cancel_pending_tracker_syncs(self.shard_tracker)
+        canceled += self._cancel_pending_tracker_syncs(getattr(self, "router_tracker", None))
+        canceled += self._cancel_pending_tracker_syncs(getattr(self, "expert_shard_tracker", None))
+
+        expert_event_index = None
+        if expert_indices:
+            self.expert_sync_event_count += 1
+            expert_event_index = self.expert_sync_event_count
+
+        if self.verbose:
+            print_rank_0(
+                f"[CDC] Step {self.step_count}: Starting blocking full sync "
+                f"(dense={len(dense_indices)}, router={len(router_indices)}, "
+                f"expert={len(expert_indices)}, canceled_inflight={canceled})."
+            )
+
+        for tracker_idx in dense_indices:
+            self._stage_tracker_sync(
+                self.shard_tracker,
+                tracker_idx,
+                tracker_kind='dense-shard',
+            )
+            self._complete_tracker_sync(
+                self.shard_tracker,
+                tracker_idx,
+                tracker_kind='dense-shard',
+                reload_main_params=False,
+                use_algorithm_specific_update=False,
+                force_full_copy=True,
+            )
+
+        for tracker_idx in router_indices:
+            self._stage_tracker_sync(
+                self.router_tracker,
+                tracker_idx,
+                tracker_kind='router',
+            )
+            self._complete_tracker_sync(
+                self.router_tracker,
+                tracker_idx,
+                tracker_kind='router',
+                reload_main_params=False,
+                use_algorithm_specific_update=False,
+                force_full_copy=True,
+            )
+
+        for tracker_idx in expert_indices:
+            self._stage_tracker_sync(
+                self.expert_shard_tracker,
+                tracker_idx,
+                tracker_kind='expert-group',
+                expert_event_index=expert_event_index,
+            )
+            self._complete_tracker_sync(
+                self.expert_shard_tracker,
+                tracker_idx,
+                tracker_kind='expert-group',
+                reload_main_params=False,
+                use_algorithm_specific_update=False,
+                force_full_copy=True,
+            )
+
+        if self.mixed_precision:
+            self.inner_optimizer.reload_model_params()
+
+        duration = time.time() - start_time
+        if self.verbose:
+            print_rank_0(
+                f"[CDC] Step {self.step_count}: Blocking full sync completed in "
+                f"{duration:.4f}s."
+            )
 
     def _complete_due_expert_syncs_batched(self) -> None:
         if not getattr(self, "expert_shard_tracker", None):
@@ -1570,6 +1695,63 @@ class CDCOptimizer(MegatronOptimizer):
             return False
         shifted_step = self.step_count - self.expert_sync_offset
         return shifted_step >= 0 and shifted_step % self.expert_sync_interval == 0
+
+    def _should_run_blocking_full_sync(self) -> bool:
+        if self.blocking_full_sync_steps <= 0:
+            return False
+        if self.step_count <= 0:
+            return False
+        return self.step_count % self.blocking_full_sync_steps == 0
+
+    def _cancel_pending_tracker_syncs(
+        self,
+        tracker_dict: Optional[Dict[int, Dict[str, Any]]],
+    ) -> int:
+        if not tracker_dict:
+            return 0
+
+        canceled = 0
+        for tracker in tracker_dict.values():
+            if int(tracker.get("next_receive_step", 0)) > 0:
+                tracker["next_receive_step"] = 0
+                tracker["sync_start_time"] = None
+                canceled += 1
+        return canceled
+
+    def _stage_tracker_sync(
+        self,
+        tracker_dict: Dict[int, Dict[str, Any]],
+        tracker_idx: int,
+        *,
+        tracker_kind: str,
+        expert_event_index: Optional[int] = None,
+    ) -> None:
+        tracker = tracker_dict[tracker_idx]
+        tracker_label = tracker.get("display_name", str(tracker_idx))
+
+        total_bytes = 0
+        for param in tracker["param_refs"]:
+            total_bytes += param.numel() * param.element_size()
+        size_mb = total_bytes / (1024 * 1024)
+
+        if self.verbose:
+            print_rank_0(
+                f"[CDC] Step {self.step_count}: Blocking full sync staging {tracker_kind} "
+                f"{tracker_label} (Size: {size_mb:.2f} MB)."
+            )
+
+        tracker["sync_start_time"] = time.time()
+        for p_local, p_staged in zip(tracker["param_refs"], tracker["staged_params"]):
+            self._copy_tensor_data(p_staged, p_local.data)
+
+        tracker["old_sent_at_step"] = tracker["sent_at_step"]
+        tracker["sent_at_step"] = self.step_count
+        tracker["sent_wd_log_cumsums"] = self._snapshot_sent_wd_log_cumsums(tracker)
+        if tracker_kind == 'expert-group':
+            if expert_event_index is not None:
+                tracker["sent_at_expert_event"] = int(expert_event_index)
+            tracker["token_load_accum"] = 0.0
+        tracker["next_receive_step"] = 0
 
     def _select_next_shard(self):
         """Select the next shard to sync based on staleness and gradient norm."""
@@ -2066,6 +2248,8 @@ class CDCOptimizer(MegatronOptimizer):
         *,
         tracker_kind: str,
         reload_main_params: bool = True,
+        use_algorithm_specific_update: bool = True,
+        force_full_copy: bool = False,
     ) -> None:
         """Complete the sync process for a tracker entry (receive & update)."""
         tracker = tracker_dict[tracker_idx]
@@ -2083,7 +2267,10 @@ class CDCOptimizer(MegatronOptimizer):
             sync_grads.append(g)
 
         # 2. All-Reduce sync_grads (Across DiLoCo Islands)
-        self._all_reduce_flattened(sync_grads, communication_dtype=self.outer_comm_dtype)
+        self._all_reduce_flattened(
+            sync_grads,
+            communication_dtype=tracker.get("comm_dtype", self.outer_comm_dtype),
+        )
 
         # 3. Calculate Score for Next Selection (Norm of Global Pseudo-Gradient)
         total_norm_sq = 0.0
@@ -2128,19 +2315,27 @@ class CDCOptimizer(MegatronOptimizer):
                 p_global.data.sub_(avg_delta)
 
         # 5. Update Local Params (Algorithm Specific)
-        if self.algorithm == 'dc' and tracker_kind == 'dense-shard':
+        if use_algorithm_specific_update and self.algorithm == 'dc' and tracker_kind == 'dense-shard':
             self.delay_compensation(tracker)
 
         else:
-            # Alpha Blending
+            # Alpha blending for normal streaming receives; hard overwrite for blocking full sync.
             for p_local, p_global in zip(param_refs, global_params):
-                p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
-                blended = (
-                    p_local.data.to(torch.float32).mul(self.streaming_alpha).add_(
-                        p_global_data, alpha=1.0 - self.streaming_alpha
+                if force_full_copy:
+                    self._copy_tensor_data(p_local.data, p_global.data)
+                else:
+                    blend_alpha = (
+                        self.router_alpha
+                        if tracker_kind == 'router' and self.router_alpha >= 0.0
+                        else self.streaming_alpha
                     )
-                )
-                p_local.data.copy_(blended.to(dtype=p_local.dtype))
+                    p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
+                    blended = (
+                        p_local.data.to(torch.float32).mul(blend_alpha).add_(
+                            p_global_data, alpha=1.0 - blend_alpha
+                        )
+                    )
+                    p_local.data.copy_(blended.to(dtype=p_local.dtype))
 
         # Keep optimizer main params in sync with model params for mixed precision.
         if self.mixed_precision and reload_main_params:
@@ -2173,8 +2368,9 @@ class CDCOptimizer(MegatronOptimizer):
             tracker_entries.append((tracker, param_refs, global_params, staged_params, sync_grads))
             batched_sync_grads.extend(sync_grads)
 
+        batch_comm_dtype = tracker_entries[0][0].get("comm_dtype", self.outer_comm_dtype)
         self._all_reduce_flattened(
-            batched_sync_grads, communication_dtype=self.outer_comm_dtype
+            batched_sync_grads, communication_dtype=batch_comm_dtype
         )
 
         tp_group = mpu.get_tensor_model_parallel_group()

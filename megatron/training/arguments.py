@@ -2701,6 +2701,9 @@ def _add_cdc_args(parser):
                        help='Number of shards for Streaming/DC DiLoCo.')
     group.add_argument('--cdc-sync-interval', type=int, default=100,
                        help='Number of inner steps between outer synchronization.')
+    group.add_argument('--cdc-blocking-full-sync-steps', type=int, default=0,
+                       help='For streaming/DC CDC: perform one blocking full sync every N successful '
+                            'inner steps. 0 disables it.')
     group.add_argument('--cdc-outer-lr', type=float, default=0.7,
                        help='Learning rate for the outer optimizer.')
     group.add_argument('--cdc-parallel-size', type=int, default=1,
@@ -2727,6 +2730,10 @@ def _add_cdc_args(parser):
                        help='Simulated communication delay (in steps) for Streaming-based methods.')
     group.add_argument('--cdc-streaming-alpha', type=float, default=0.5,
                        help='Alpha for Streaming DiLoCo blending (local = alpha * local + (1-alpha) * global).')
+    group.add_argument('--cdc-moe-router-alpha', type=float, default=-1.0,
+                       help='For dense-expert-hybrid: router-specific streaming alpha. '
+                            'A negative value inherits --cdc-streaming-alpha; 0.0 hard-overwrites '
+                            'local routers with the global averaged router on receive.')
     group.add_argument('--cdc-shard-pattern', type=str, default='sequential',
                        choices=['sequential', 'stride'],
                        help='Layer sharding pattern across CDC shards.')

@@ -141,9 +141,6 @@ class CDCOptimizerNew(MegatronOptimizer):
         self._router_named_model_params = self._collect_router_named_params(
             self._named_model_param_list
         )
-        self._local_expert_named_params = self._collect_local_routed_expert_named_params(
-            self._named_model_param_list
-        )
         self.enable_moe_expert_refresh = (
             self.moe_param_mode == "dense-expert-hybrid" and self.expert_sync_interval > 0
         )
@@ -171,10 +168,13 @@ class CDCOptimizerNew(MegatronOptimizer):
 
         self._validate_configuration()
 
-        self._moe_module_index = (
-            self._build_moe_module_index() if self.track_expert_token_load else {}
-        )
-        self._local_grouped_expert_params = self._group_local_routed_expert_named_params()
+        self._moe_module_index: Dict[str, torch.nn.Module] = {}
+        self._local_grouped_expert_params: Dict[str, List[torch.nn.Parameter]] = {}
+        if self.enable_moe_expert_refresh:
+            (
+                self._moe_module_index,
+                self._local_grouped_expert_params,
+            ) = self._build_local_moe_expert_layout()
 
         self.diloco_state: Optional[DiLoCoBranchState] = None
         self.streaming_state: Optional[StreamingBranchState] = None
@@ -416,22 +416,6 @@ class CDCOptimizerNew(MegatronOptimizer):
     def _is_moe_router_param_name(param_name: str) -> bool:
         return ".router." in param_name
 
-    @staticmethod
-    def _routed_expert_group_key(param_name: str) -> Optional[str]:
-        match = re.search(r"(.*?\.experts\.local_experts\.\d+)\.", param_name)
-        if match is None:
-            return None
-        return match.group(1)
-
-    def _collect_local_routed_expert_named_params(
-        self, named_params: List[Tuple[str, torch.nn.Parameter]]
-    ) -> List[Tuple[str, torch.nn.Parameter]]:
-        return [
-            (name, param)
-            for name, param in named_params
-            if self._is_routed_expert_param_name(name)
-        ]
-
     def _collect_router_named_params(
         self, named_params: List[Tuple[str, torch.nn.Parameter]]
     ) -> List[Tuple[str, torch.nn.Parameter]]:
@@ -479,16 +463,83 @@ class CDCOptimizerNew(MegatronOptimizer):
 
         return tracked
 
-    def _group_local_routed_expert_named_params(
-        self,
-    ) -> Dict[str, List[Tuple[str, torch.nn.Parameter]]]:
-        grouped: Dict[str, List[Tuple[str, torch.nn.Parameter]]] = {}
-        for name, param in self._local_expert_named_params:
-            group_key = self._routed_expert_group_key(name)
-            if group_key is None:
+    @staticmethod
+    def _is_moe_module(module: torch.nn.Module) -> bool:
+        return hasattr(module, "token_dispatcher") and hasattr(module, "experts")
+
+    def _globalize_moe_module_name(self, local_name: str, module: torch.nn.Module) -> str:
+        normalized_name = self._normalize_module_name(local_name)
+        layer_number = getattr(module, "layer_number", None)
+        if layer_number is None:
+            raise ValueError(
+                f"MoE module {normalized_name!r} is missing layer_number; "
+                "cannot build a globally unique CDC expert key."
+            )
+
+        match = re.match(r"(.*?\.layers\.)(\d+)(\..*)?$", normalized_name)
+        if match is None:
+            raise ValueError(
+                f"MoE module {normalized_name!r} does not contain a '.layers.<idx>' segment; "
+                "CDCOptimizerNew cannot globalize its expert identity."
+            )
+
+        prefix, _, suffix = match.groups()
+        global_layer_idx = int(layer_number) - 1
+        return f"{prefix}{global_layer_idx}{suffix or ''}"
+
+    def _iter_global_moe_modules(self) -> Iterable[Tuple[str, torch.nn.Module]]:
+        for local_name, module in self._iter_named_modules_unique(self.model_chunks):
+            if not self._is_moe_module(module):
                 continue
-            grouped.setdefault(group_key, []).append((name, param))
-        return grouped
+            yield self._globalize_moe_module_name(local_name, module), module
+
+    def _build_local_moe_expert_layout(
+        self,
+    ) -> Tuple[Dict[str, torch.nn.Module], Dict[str, List[torch.nn.Parameter]]]:
+        module_index: Dict[str, torch.nn.Module] = {}
+        grouped_params: Dict[str, List[torch.nn.Parameter]] = {}
+
+        for global_module_key, module in self._iter_global_moe_modules():
+            if global_module_key in module_index:
+                raise ValueError(
+                    f"Duplicate global MoE module key {global_module_key!r} detected while "
+                    "building CDC expert layout."
+                )
+            module_index[global_module_key] = module
+
+            experts_module = getattr(module, "experts", None)
+            local_experts = getattr(experts_module, "local_experts", None)
+            if local_experts is None:
+                trainable_expert_params = [
+                    param
+                    for param in experts_module.parameters(recurse=True)
+                    if getattr(param, "requires_grad", False)
+                ]
+                if trainable_expert_params:
+                    raise NotImplementedError(
+                        "CDCOptimizerNew dense-expert-hybrid currently expects SequentialMLP-style "
+                        "local_experts.* parameter layout. Grouped expert weights are not yet supported."
+                    )
+                continue
+
+            for local_expert_idx, expert in enumerate(local_experts):
+                param_refs = [
+                    param
+                    for param in expert.parameters()
+                    if getattr(param, "requires_grad", False)
+                ]
+                if not param_refs:
+                    continue
+
+                group_key = f"{global_module_key}.experts.local_experts.{local_expert_idx}"
+                if group_key in grouped_params:
+                    raise ValueError(
+                        f"Duplicate global expert group key {group_key!r} detected while "
+                        "building CDC expert layout."
+                    )
+                grouped_params[group_key] = param_refs
+
+        return module_index, grouped_params
 
     @staticmethod
     def _parse_layer_index(param_name: str) -> Optional[int]:
@@ -539,16 +590,6 @@ class CDCOptimizerNew(MegatronOptimizer):
                 continue
             merged.update(names)
         return sorted(merged, key=self._expert_group_sort_key)
-
-    def _build_moe_module_index(self) -> Dict[str, torch.nn.Module]:
-        module_index: Dict[str, torch.nn.Module] = {}
-        for name, module in self._iter_named_modules_unique(self.model_chunks):
-            normalized_name = self._normalize_module_name(name)
-            if not normalized_name:
-                continue
-            if hasattr(module, "token_dispatcher") and hasattr(module, "experts"):
-                module_index[normalized_name] = module
-        return module_index
 
     def _lookup_moe_module(self, module_key: str) -> Optional[torch.nn.Module]:
         if not module_key:
@@ -735,15 +776,8 @@ class CDCOptimizerNew(MegatronOptimizer):
                     "dense-expert-hybrid requested expert refresh, but no routed expert groups were discovered."
                 )
 
-            if self._local_expert_named_params and not self._local_grouped_expert_params:
-                raise NotImplementedError(
-                    "CDCOptimizerNew dense-expert-hybrid currently expects SequentialMLP-style "
-                    "local_experts.* parameter names. Grouped expert weights are not yet supported."
-                )
-
             for slot_id, expert_group_name in enumerate(global_expert_group_names):
-                local_group = self._local_grouped_expert_params.get(expert_group_name, [])
-                local_params = [param for _, param in local_group]
+                local_params = self._local_grouped_expert_params.get(expert_group_name, [])
                 moe_module_key, _, local_expert_idx = self._extract_expert_group_metadata(
                     expert_group_name
                 )
@@ -1545,7 +1579,7 @@ class CDCOptimizerNew(MegatronOptimizer):
             state["diloco"] = self._serialize_diloco_state()
         else:
             assert self.streaming_state is not None
-            state["streaming_layout_version"] = 2
+            state["streaming_layout_version"] = 3
             state["streaming"] = {
                 "next_dense_slot": self.streaming_state.next_dense_slot,
                 "next_expert_slot": self.streaming_state.next_expert_slot,
@@ -1628,6 +1662,16 @@ class CDCOptimizerNew(MegatronOptimizer):
                 "This CDC checkpoint uses the legacy hybrid layout with router parameters "
                 "embedded in dense shards. The current implementation keeps routers in a "
                 "dedicated tracker, so resume from this CDC optimizer state is not supported."
+            )
+        if (
+            self.enable_moe_expert_refresh
+            and layout_version < 3
+            and not self._legacy_local_expert_layout_is_compatible()
+        ):
+            raise ValueError(
+                "This CDC checkpoint uses the legacy expert layout based on local layer indices. "
+                "The current implementation uses globally unique expert identities across PP/VP, "
+                "so resume from this CDC optimizer state is not supported for the current model layout."
             )
         self.streaming_state.next_dense_slot = int(
             streaming_state.get("next_dense_slot", self.streaming_state.next_dense_slot)
@@ -1750,6 +1794,13 @@ class CDCOptimizerNew(MegatronOptimizer):
                 tracker.outer_optimizer.state.clear()
 
             self._all_reduce_flattened(tracker.params, communication_dtype=self.outer_comm_dtype)
+
+    def _legacy_local_expert_layout_is_compatible(self) -> bool:
+        try:
+            pp_world_size = dist.get_world_size(group=self.pp_group) if self.pp_group else 1
+        except Exception:
+            pp_world_size = 1
+        return pp_world_size <= 1 and len(self.model_chunks) <= 1
 
     # ------------------------------------------------------------------
     # Communication / utilities
