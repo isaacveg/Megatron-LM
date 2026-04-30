@@ -1,0 +1,79 @@
+{
+  "container": {
+    "name": "CHANGE_ME_CONTAINER_NAME",
+    "workdir": "/data/yzhu/megatron-lm-moe-exp",
+    "runtime_dir": "/tmp/megatron-supervisor",
+    "start_timeout_sec": 60
+  },
+  "host_workdir": "/data/yzhu/megatron-lm-moe-exp",
+  "max_concurrent_jobs": 2,
+  "poll_interval_sec": 60,
+  "npu_smi_command": "npu-smi info",
+  "idle": {
+    "npu_hbm_mb": 8000,
+    "npu_aicore_pct": 10,
+    "require_no_processes": true,
+    "consecutive_checks": 3,
+    "interval_sec": 60,
+    "cooldown_sec": 600
+  },
+  "npu_pools": [
+    {
+      "id": "slot0",
+      "npus": "0,1,2,3"
+    },
+    {
+      "id": "slot1",
+      "npus": "4,5,6,7"
+    }
+  ],
+  "hold_error_types": [
+    "oom",
+    "disk_full",
+    "checkpoint_corrupt",
+    "config_mismatch",
+    "config_changed"
+  ],
+  "enforce_config_hash": false,
+  "env": {},
+  "jobs": [
+    {
+      "enabled": false,
+      "id": "example_topk4_age20",
+      "script": "/data/yzhu/megatron-lm-moe-exp/scripts/pretrain_llama_moe1b_hybrid_updatenorm_topk4_i10_o5_age20_20k.sh",
+      "run_name": "moe1b_hybrid_updatenorm_topk4_i10_o5_age20_e8_top2_20k",
+      "ckpt_dir": "/data/yzhu/megatron-lm-moe-exp/ckpts/moe1b_hybrid_updatenorm_topk4_i10_o5_age20_e8_top2_20k",
+      "train_iters": 20000,
+      "save_interval": 1000,
+      "npus_per_node": 4,
+      "allowed_npu_pools": [
+        "slot0",
+        "slot1"
+      ],
+      "master_port": 6061,
+      "priority": 10,
+      "max_retries": 5,
+      "max_stagnant_failures": 2,
+      "env": {}
+    },
+    {
+      "enabled": false,
+      "id": "example_topk3_s10_i10_age20",
+      "script": "/data/yzhu/megatron-lm-moe-exp/scripts/pretrain_llama_moe1b_hybrid_updatenorm_topk3_s10_i10_e20_o5_age20_20k.sh",
+      "run_name": "moe1b_hybrid_updatenorm_topk3_s10_i10_e20_o5_age20_minage0_noblockfs_e8_top2_20k",
+      "ckpt_dir": "/data/yzhu/megatron-lm-moe-exp/ckpts/moe1b_hybrid_updatenorm_topk3_s10_i10_e20_o5_age20_minage0_noblockfs_e8_top2_20k",
+      "train_iters": 20000,
+      "save_interval": 1000,
+      "npus_per_node": 4,
+      "allowed_npu_pools": [
+        "slot0",
+        "slot1"
+      ],
+      "master_port": 6062,
+      "priority": 9,
+      "max_retries": 5,
+      "max_stagnant_failures": 2,
+      "env": {}
+    }
+  ]
+}
