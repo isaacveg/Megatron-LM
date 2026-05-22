@@ -2706,6 +2706,13 @@ def _add_cdc_args(parser):
                             'inner steps. 0 disables it.')
     group.add_argument('--cdc-outer-lr', type=float, default=0.7,
                        help='Learning rate for the outer optimizer.')
+    group.add_argument('--cdc-dense-outer-lr', type=float, default=-1.0,
+                       help='For streaming/DC CDC: dense-shard outer optimizer LR. '
+                            'A negative value inherits --cdc-outer-lr. In dense-expert-hybrid, '
+                            'the dedicated router tracker uses this LR as part of dense refresh.')
+    group.add_argument('--cdc-moe-expert-outer-lr', type=float, default=-1.0,
+                       help='For dense-expert-hybrid: routed-expert outer optimizer LR. '
+                            'A negative value inherits --cdc-outer-lr.')
     group.add_argument('--cdc-parallel-size', type=int, default=1,
                        help='Number of DiLoCo islands (outer data parallel size).')
     group.add_argument('--cdc-offload-outer-opt', action='store_true',
@@ -2730,10 +2737,18 @@ def _add_cdc_args(parser):
                        help='Simulated communication delay (in steps) for Streaming-based methods.')
     group.add_argument('--cdc-streaming-alpha', type=float, default=0.5,
                        help='Alpha for Streaming DiLoCo blending (local = alpha * local + (1-alpha) * global).')
+    group.add_argument('--cdc-dense-alpha', type=float, default=-1.0,
+                       help='For streaming/DC CDC: dense-shard-specific streaming alpha. '
+                            'A negative value inherits --cdc-streaming-alpha; 0.0 hard-overwrites '
+                            'local dense shards with the global state on receive.')
     group.add_argument('--cdc-moe-router-alpha', type=float, default=-1.0,
                        help='For dense-expert-hybrid: router-specific streaming alpha. '
                             'A negative value inherits --cdc-streaming-alpha; 0.0 hard-overwrites '
                             'local routers with the global averaged router on receive.')
+    group.add_argument('--cdc-moe-expert-alpha', type=float, default=-1.0,
+                       help='For dense-expert-hybrid: routed-expert-specific streaming alpha. '
+                            'A negative value inherits --cdc-streaming-alpha; 0.0 hard-overwrites '
+                            'local expert groups with the global state on receive.')
     group.add_argument('--cdc-shard-pattern', type=str, default='sequential',
                        choices=['sequential', 'stride'],
                        help='Layer sharding pattern across CDC shards.')

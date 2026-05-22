@@ -42,11 +42,34 @@ class CDCOptimizer(MegatronOptimizer):
         self.step_count = 0
         self.algorithm = args.cdc_algorithm
         self.offload_outer_opt = args.cdc_offload_outer_opt
-        self.outer_lr = args.cdc_outer_lr
+        self.outer_lr = float(args.cdc_outer_lr)
+        self.dense_outer_lr_arg = float(getattr(args, "cdc_dense_outer_lr", -1.0))
+        self.expert_outer_lr_arg = float(getattr(args, "cdc_moe_expert_outer_lr", -1.0))
+        self.dense_outer_lr = self._resolve_component_outer_lr(
+            self.dense_outer_lr_arg, "cdc_dense_outer_lr"
+        )
+        self.expert_outer_lr = self._resolve_component_outer_lr(
+            self.expert_outer_lr_arg, "cdc_moe_expert_outer_lr"
+        )
         self.num_shards = args.cdc_num_shards
         self.dc_lambda = args.cdc_dc_lambda
-        self.streaming_alpha = args.cdc_streaming_alpha
-        self.router_alpha = float(args.cdc_moe_router_alpha)
+        self.streaming_alpha = float(args.cdc_streaming_alpha)
+        if self.streaming_alpha < 0.0 or self.streaming_alpha > 1.0:
+            raise ValueError(
+                f"cdc_streaming_alpha must be in [0, 1], got {self.streaming_alpha}"
+            )
+        self.dense_alpha_arg = float(getattr(args, "cdc_dense_alpha", -1.0))
+        self.router_alpha_arg = float(args.cdc_moe_router_alpha)
+        self.expert_alpha_arg = float(getattr(args, "cdc_moe_expert_alpha", -1.0))
+        self.dense_alpha = self._resolve_component_alpha(
+            self.dense_alpha_arg, "cdc_dense_alpha"
+        )
+        self.router_alpha = self._resolve_component_alpha(
+            self.router_alpha_arg, "cdc_moe_router_alpha"
+        )
+        self.expert_alpha = self._resolve_component_alpha(
+            self.expert_alpha_arg, "cdc_moe_expert_alpha"
+        )
         self.delay = args.cdc_delay
         self.dc_N = args.cdc_dc_N
         self.shard_pattern = args.cdc_shard_pattern
@@ -132,8 +155,6 @@ class CDCOptimizer(MegatronOptimizer):
             raise ValueError(
                 f"cdc_blocking_full_sync_steps must be >= 0, got {self.blocking_full_sync_steps}"
             )
-        if self.router_alpha > 1.0:
-            raise ValueError(f"cdc_moe_router_alpha must be <= 1.0, got {self.router_alpha}")
         if self.expert_selection not in {'round_robin', 'score'}:
             raise ValueError(
                 f"Unknown cdc_moe_expert_selection: {self.expert_selection}"
@@ -172,11 +193,16 @@ class CDCOptimizer(MegatronOptimizer):
             print_rank_0(
                 f"[CDC] Initialized {self.algorithm} optimizer. Sync interval: "
                 f"{self.sync_interval}, Shards: {self.num_shards}, "
+                f"outer_lr={self.outer_lr}, "
+                f"dense_outer_lr={self._format_component_value(self.dense_outer_lr_arg, self.dense_outer_lr)}, "
+                f"expert_outer_lr={self._format_component_value(self.expert_outer_lr_arg, self.expert_outer_lr)}, "
                 f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}, "
                 f"moe_param_mode={self.moe_param_mode}, "
+                f"dense_alpha={self._format_component_alpha(self.dense_alpha_arg, self.dense_alpha)}, "
                 f"router_refresh={'every_dense_slot' if self.enable_moe_router_refresh else 'off'}, "
-                f"router_alpha={'inherit' if self.router_alpha < 0.0 else self.router_alpha}, "
+                f"router_alpha={self._format_component_alpha(self.router_alpha_arg, self.router_alpha)}, "
                 f"expert_refresh={'on' if self.enable_moe_expert_refresh else 'off'}, "
+                f"expert_alpha={self._format_component_alpha(self.expert_alpha_arg, self.expert_alpha)}, "
                 f"expert_topk={self.expert_topk}, expert_score_mode={self.expert_score_mode}, "
                 f"expert_min_age_slots={self.expert_min_age_slots}, "
                 f"blocking_full_sync={'off' if self.blocking_full_sync_steps <= 0 else f'every_{self.blocking_full_sync_steps}_steps'}"
@@ -188,6 +214,28 @@ class CDCOptimizer(MegatronOptimizer):
             self._init_streaming_state()
         else:
             raise ValueError(f"Unknown DiLoCo algorithm: {self.algorithm}")
+
+    def _resolve_component_alpha(self, alpha_value: float, arg_name: str) -> float:
+        """Resolve per-component alpha; negative values inherit cdc_streaming_alpha."""
+        if alpha_value < 0.0:
+            return self.streaming_alpha
+        if alpha_value > 1.0:
+            raise ValueError(f"{arg_name} must be <= 1.0, got {alpha_value}")
+        return float(alpha_value)
+
+    def _resolve_component_outer_lr(self, lr_value: float, arg_name: str) -> float:
+        """Resolve per-component outer LR; negative values inherit cdc_outer_lr."""
+        if lr_value < 0.0:
+            return self.outer_lr
+        return float(lr_value)
+
+    @staticmethod
+    def _format_component_value(raw_value: float, effective_value: float) -> str:
+        if raw_value < 0.0:
+            return f"inherit({effective_value})"
+        return str(effective_value)
+
+    _format_component_alpha = _format_component_value
 
     # ------------------------------------------------------------------
     # LR/WD tracking (for DC weight-decay debias)
@@ -656,6 +704,32 @@ class CDCOptimizer(MegatronOptimizer):
                 saved_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
             )
 
+    def _apply_global_params_to_local(
+        self,
+        tracker: Dict[str, Any],
+        *,
+        force_full_copy: bool = False,
+    ) -> None:
+        """Apply the tracker global state to local model params with the tracker's alpha."""
+        alpha = float(tracker.get("apply_alpha", self.streaming_alpha))
+        if force_full_copy:
+            alpha = 0.0
+        if alpha == 1.0:
+            return
+
+        for p_local, p_global in zip(tracker["param_refs"], tracker["params"]):
+            if alpha == 0.0:
+                self._copy_tensor_data(p_local.data, p_global.data)
+                continue
+
+            p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
+            blended = (
+                p_local.data.to(torch.float32).mul(alpha).add_(
+                    p_global_data, alpha=1.0 - alpha
+                )
+            )
+            p_local.data.copy_(blended.to(dtype=p_local.dtype))
+
     @staticmethod
     def _clone_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
         """Detach and clone a tensor to CPU for checkpointing."""
@@ -878,7 +952,10 @@ class CDCOptimizer(MegatronOptimizer):
         moe_module_key: Optional[str] = None,
         local_expert_idx: Optional[int] = None,
         comm_dtype: Optional[torch.dtype] = None,
+        apply_alpha: Optional[float] = None,
+        outer_lr: Optional[float] = None,
     ) -> Dict[str, Any]:
+        tracker_outer_lr = self.outer_lr if outer_lr is None else float(outer_lr)
         param_group_indices = [
             self._get_param_group_index_for_model_param(p) for p in param_refs
         ]
@@ -895,6 +972,8 @@ class CDCOptimizer(MegatronOptimizer):
             "params": [],
             "staged_params": [],
             "comm_dtype": comm_dtype if comm_dtype is not None else self.outer_comm_dtype,
+            "apply_alpha": self.streaming_alpha if apply_alpha is None else float(apply_alpha),
+            "outer_lr": tracker_outer_lr,
             "sent_at_step": 0,
             "old_sent_at_step": 0,
             "next_receive_step": 0,
@@ -911,12 +990,12 @@ class CDCOptimizer(MegatronOptimizer):
             tracker["params"].append(self._clone_param_for_outer_state(p))
             tracker["staged_params"].append(self._clone_param_for_outer_state(p))
 
-        if self.outer_lr != 1.0 and len(tracker["params"]) > 0:
+        if tracker_outer_lr != 1.0 and len(tracker["params"]) > 0:
             for p in tracker["params"]:
                 p.requires_grad_(True)
             tracker["outer_optimizer"] = SGD(
                 tracker["params"],
-                lr=self.outer_lr,
+                lr=tracker_outer_lr,
                 momentum=0.9,
                 nesterov=True,
             )
@@ -1116,6 +1195,8 @@ class CDCOptimizer(MegatronOptimizer):
                 tp_group=tp_group,
                 pp_group=pp_group,
                 display_name=f"dense-shard-{shard_idx}",
+                apply_alpha=self.dense_alpha,
+                outer_lr=self.dense_outer_lr,
             )
 
             self.shard_tracker[shard_idx] = tracker
@@ -1134,6 +1215,8 @@ class CDCOptimizer(MegatronOptimizer):
                 pp_group=pp_group,
                 display_name="moe-router",
                 comm_dtype=torch.float32,
+                apply_alpha=self.router_alpha,
+                outer_lr=self.dense_outer_lr,
             )
             self.router_tracker[0] = router_tracker
 
@@ -1165,6 +1248,8 @@ class CDCOptimizer(MegatronOptimizer):
                     display_name=expert_group_name,
                     moe_module_key=moe_module_key,
                     local_expert_idx=local_expert_idx,
+                    apply_alpha=self.expert_alpha,
+                    outer_lr=self.expert_outer_lr,
                 )
                 self.expert_shard_tracker[expert_idx] = tracker
 
@@ -2319,23 +2404,8 @@ class CDCOptimizer(MegatronOptimizer):
             self.delay_compensation(tracker)
 
         else:
-            # Alpha blending for normal streaming receives; hard overwrite for blocking full sync.
-            for p_local, p_global in zip(param_refs, global_params):
-                if force_full_copy:
-                    self._copy_tensor_data(p_local.data, p_global.data)
-                else:
-                    blend_alpha = (
-                        self.router_alpha
-                        if tracker_kind == 'router' and self.router_alpha >= 0.0
-                        else self.streaming_alpha
-                    )
-                    p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
-                    blended = (
-                        p_local.data.to(torch.float32).mul(blend_alpha).add_(
-                            p_global_data, alpha=1.0 - blend_alpha
-                        )
-                    )
-                    p_local.data.copy_(blended.to(dtype=p_local.dtype))
+            # Alpha blending for normal streaming receives; alpha=0 hard-overwrites local.
+            self._apply_global_params_to_local(tracker, force_full_copy=force_full_copy)
 
         # Keep optimizer main params in sync with model params for mixed precision.
         if self.mixed_precision and reload_main_params:
@@ -2414,14 +2484,7 @@ class CDCOptimizer(MegatronOptimizer):
                 for p_global, avg_delta in zip(global_params, sync_grads):
                     p_global.data.sub_(avg_delta)
 
-            for p_local, p_global in zip(param_refs, global_params):
-                p_global_data = p_global.data.to(device=p_local.device, dtype=torch.float32)
-                blended = (
-                    p_local.data.to(torch.float32).mul(self.streaming_alpha).add_(
-                        p_global_data, alpha=1.0 - self.streaming_alpha
-                    )
-                )
-                p_local.data.copy_(blended.to(dtype=p_local.dtype))
+            self._apply_global_params_to_local(tracker)
 
         if self.mixed_precision:
             self.inner_optimizer.reload_model_params()
