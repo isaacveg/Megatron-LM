@@ -121,6 +121,12 @@ _CDC_PARALLEL_GLOBAL_RANKS = None
 _MPU_CDC_PARALLEL_WORLD_SIZE = None
 _MPU_CDC_PARALLEL_RANK = None
 
+# Data sampling should shard across the original full DP replica set, even when
+# CDC replaces Megatron's DP group with an inner-island DP group.
+_DATA_SAMPLER_GLOBAL_RANKS = None
+_MPU_DATA_SAMPLER_WORLD_SIZE = None
+_MPU_DATA_SAMPLER_RANK = None
+
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
@@ -813,6 +819,9 @@ def initialize_model_parallel(
     global _CDC_PARALLEL_GLOBAL_RANKS
     global _MPU_CDC_PARALLEL_WORLD_SIZE
     global _MPU_CDC_PARALLEL_RANK
+    global _DATA_SAMPLER_GLOBAL_RANKS
+    global _MPU_DATA_SAMPLER_WORLD_SIZE
+    global _MPU_DATA_SAMPLER_RANK
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
     # for ranks in generator_wrapper('dp'):
@@ -848,6 +857,10 @@ def initialize_model_parallel(
 
     for global_dp_ranks in all_dp_ranks_lists:
         assert len(global_dp_ranks) == data_parallel_size
+        if rank in global_dp_ranks:
+            _DATA_SAMPLER_GLOBAL_RANKS = global_dp_ranks
+            _MPU_DATA_SAMPLER_WORLD_SIZE = len(global_dp_ranks)
+            _MPU_DATA_SAMPLER_RANK = global_dp_ranks.index(rank)
         
         # 1. Create Inner DP Groups (Megatron DP)
         for i in range(cdc_parallel_size):
@@ -1885,6 +1898,27 @@ def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=Fa
         return 0
 
 
+def get_data_sampler_world_size():
+    """Return world size used for sharding input data."""
+    if _MPU_DATA_SAMPLER_WORLD_SIZE is not None:
+        return _MPU_DATA_SAMPLER_WORLD_SIZE
+    return get_data_parallel_world_size()
+
+
+def get_data_sampler_rank():
+    """Return rank used for sharding input data."""
+    if _MPU_DATA_SAMPLER_RANK is not None:
+        return _MPU_DATA_SAMPLER_RANK
+    return get_data_parallel_rank()
+
+
+def get_data_sampler_global_ranks():
+    """Return global ranks that share the same data stream partitioning."""
+    if _DATA_SAMPLER_GLOBAL_RANKS is not None:
+        return _DATA_SAMPLER_GLOBAL_RANKS
+    return _DATA_PARALLEL_GLOBAL_RANKS
+
+
 def get_context_parallel_world_size():
     """Return world size for the context parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -2149,6 +2183,15 @@ def destroy_model_parallel():
 
     global _MPU_CDC_PARALLEL_RANK
     _MPU_CDC_PARALLEL_RANK = None
+
+    global _DATA_SAMPLER_GLOBAL_RANKS
+    _DATA_SAMPLER_GLOBAL_RANKS = None
+
+    global _MPU_DATA_SAMPLER_WORLD_SIZE
+    _MPU_DATA_SAMPLER_WORLD_SIZE = None
+
+    global _MPU_DATA_SAMPLER_RANK
+    _MPU_DATA_SAMPLER_RANK = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
