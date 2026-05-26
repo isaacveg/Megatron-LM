@@ -2726,13 +2726,13 @@ def _add_cdc_args(parser):
     group.add_argument('--cdc-dc-lambda-max', type=float, default=10.0,
                        help='Max lambda clamp for DC-DiLoCo delay compensation (update-space formulation).')
     group.add_argument('--cdc-dc-lambda-scope', type=str, default='shard',
-                       choices=['shard', 'tensor', 'local'],
-                       help='Lambda reduction scope for DC-DiLoCo delay compensation.')
-    group.add_argument('--cdc-dc-debias-wd', action='store_true',
-                       help='Enable decoupled weight decay debiasing in delay compensation.')
+                       choices=['shard'],
+                       help='Lambda reduction scope for DC-DiLoCo delay compensation. Only per-shard '
+                            'lambda is supported; tensor/local scopes have been removed.')
     group.add_argument('--cdc-dc-type', type=str, default='update',
-                       choices=['update', 'legacy'],
-                       help='Delay compensation formulation for DC-DiLoCo.')
+                       choices=['update'],
+                       help='Delay compensation formulation for DC-DiLoCo. Only the update-space '
+                            'formulation is supported; the legacy formulation has been removed.')
     group.add_argument('--cdc-delay', type=int, default=0,
                        help='Simulated communication delay (in steps) for Streaming-based methods.')
     group.add_argument('--cdc-streaming-alpha', type=float, default=0.5,
