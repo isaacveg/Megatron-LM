@@ -2745,6 +2745,11 @@ def _add_cdc_args(parser):
                        help='For dense-expert-hybrid: router-specific streaming alpha. '
                             'A negative value inherits --cdc-streaming-alpha; 0.0 hard-overwrites '
                             'local routers with the global averaged router on receive.')
+    group.add_argument('--cdc-moe-router-sync-mode', type=str, default='dense',
+                       choices=['dense', 'expert'],
+                       help='For dense-expert-hybrid: schedule for the dedicated router tracker. '
+                            '"dense" refreshes routers with dense CDC slots; "expert" refreshes '
+                            'routers with routed-expert sync slots.')
     group.add_argument('--cdc-moe-expert-alpha', type=float, default=-1.0,
                        help='For dense-expert-hybrid: routed-expert-specific streaming alpha. '
                             'A negative value inherits --cdc-streaming-alpha; 0.0 hard-overwrites '
@@ -2774,6 +2779,10 @@ def _add_cdc_args(parser):
                        choices=['update_norm', 'token_load', 'mixed'],
                        help='For dense-expert-hybrid with selection=score: scoring metric used to rank '
                             'routed expert groups.')
+    group.add_argument('--cdc-moe-expert-layerwise-selection', action='store_true',
+                       help='For dense-expert-hybrid: restrict each expert sync slot to one MoE layer. '
+                            'The selected MoE layer is advanced round-robin, and top-k/RR selection is '
+                            'applied only among routed expert groups in that layer.')
     group.add_argument('--cdc-moe-expert-max-age-slots', type=int, default=0,
                        help='For dense-expert-hybrid: max staleness in expert-sync slots before a routed '
                             'expert group is forced to sync. 0 disables slot-based age capping.')

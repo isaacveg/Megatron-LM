@@ -61,6 +61,7 @@ class CDCOptimizer(MegatronOptimizer):
         self.dense_alpha_arg = float(getattr(args, "cdc_dense_alpha", -1.0))
         self.router_alpha_arg = float(args.cdc_moe_router_alpha)
         self.expert_alpha_arg = float(getattr(args, "cdc_moe_expert_alpha", -1.0))
+        self.router_sync_mode = str(args.cdc_moe_router_sync_mode).lower()
         self.dense_alpha = self._resolve_component_alpha(
             self.dense_alpha_arg, "cdc_dense_alpha"
         )
@@ -79,6 +80,7 @@ class CDCOptimizer(MegatronOptimizer):
         self.expert_selection = str(args.cdc_moe_expert_selection).lower()
         self.expert_topk = int(args.cdc_moe_expert_topk)
         self.expert_score_mode = str(args.cdc_moe_expert_score_mode).lower()
+        self.expert_layerwise_selection = bool(args.cdc_moe_expert_layerwise_selection)
         self.expert_max_age_slots = int(args.cdc_moe_expert_max_age_slots)
         self.expert_min_age_slots = int(args.cdc_moe_expert_min_age_slots)
         self.expert_max_staleness = int(args.cdc_moe_expert_max_staleness)
@@ -124,6 +126,9 @@ class CDCOptimizer(MegatronOptimizer):
         )
         self._token_load_source_debug_printed = False
         self._token_load_step_debug_printed = False
+        self._token_load_module_to_tracker_indices: Dict[str, List[int]] = {}
+        self._token_load_hooked_expert_module_ids = set()
+        self._token_load_hook_handles = []
         tracked_params = self.tracked_model_param_list
         self.model_param_dtype = tracked_params[0].dtype if tracked_params else torch.float32
         # Follow Streaming DiLoCo: keep outer-state math in fp32, but keep communication low
@@ -135,8 +140,11 @@ class CDCOptimizer(MegatronOptimizer):
         # Initialized for all algorithms so checkpoint/state construction does not fail.
         self.next_shard_idx = 0
         self.next_expert_group_idx = 0
+        self.next_expert_layer_idx = 0
         self.expert_sync_event_count = 0
         self._cdc_state_loaded = False
+        self._expert_layer_to_tracker_indices: Dict[int, List[int]] = {}
+        self._expert_layer_order: List[int] = []
 
         if self.moe_param_mode == 'dense-expert-hybrid' and self.algorithm != 'streaming':
             raise ValueError(
@@ -190,11 +198,12 @@ class CDCOptimizer(MegatronOptimizer):
                 f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}, "
                 f"moe_param_mode={self.moe_param_mode}, "
                 f"dense_alpha={self._format_component_alpha(self.dense_alpha_arg, self.dense_alpha)}, "
-                f"router_refresh={'every_dense_slot' if self.enable_moe_router_refresh else 'off'}, "
+                f"router_refresh={self.router_sync_mode if self.enable_moe_router_refresh else 'off'}, "
                 f"router_alpha={self._format_component_alpha(self.router_alpha_arg, self.router_alpha)}, "
                 f"expert_refresh={'on' if self.enable_moe_expert_refresh else 'off'}, "
                 f"expert_alpha={self._format_component_alpha(self.expert_alpha_arg, self.expert_alpha)}, "
                 f"expert_topk={self.expert_topk}, expert_score_mode={self.expert_score_mode}, "
+                f"expert_layerwise_selection={self.expert_layerwise_selection}, "
                 f"expert_min_age_slots={self.expert_min_age_slots}, "
                 f"blocking_full_sync={'off' if self.blocking_full_sync_steps <= 0 else f'every_{self.blocking_full_sync_steps}_steps'}"
             )
@@ -205,6 +214,9 @@ class CDCOptimizer(MegatronOptimizer):
             self._init_streaming_state()
         else:
             raise ValueError(f"Unknown DiLoCo algorithm: {self.algorithm}")
+
+        if self.track_expert_token_load:
+            self._register_token_load_expert_hooks()
 
     def _resolve_component_alpha(self, alpha_value: float, arg_name: str) -> float:
         """Resolve per-component alpha; negative values inherit cdc_streaming_alpha."""
@@ -362,6 +374,7 @@ class CDCOptimizer(MegatronOptimizer):
             "step_count": self.step_count,
             "next_shard_idx": self.next_shard_idx,
             "next_expert_group_idx": self.next_expert_group_idx,
+            "next_expert_layer_idx": self.next_expert_layer_idx,
             "expert_sync_event_count": self.expert_sync_event_count,
         }
 
@@ -403,6 +416,7 @@ class CDCOptimizer(MegatronOptimizer):
                 "token_load_accum": float(tracker.get("token_load_accum", 0.0)),
                 "sent_at_expert_event": int(tracker.get("sent_at_expert_event", 0)),
                 "moe_module_key": tracker.get("moe_module_key"),
+                "moe_layer_idx": tracker.get("moe_layer_idx"),
                 "local_expert_idx": tracker.get("local_expert_idx"),
             }
 
@@ -454,6 +468,9 @@ class CDCOptimizer(MegatronOptimizer):
         self.next_shard_idx = cdc_state.get("next_shard_idx", self.next_shard_idx)
         self.next_expert_group_idx = cdc_state.get(
             "next_expert_group_idx", self.next_expert_group_idx
+        )
+        self.next_expert_layer_idx = cdc_state.get(
+            "next_expert_layer_idx", self.next_expert_layer_idx
         )
         self.expert_sync_event_count = cdc_state.get(
             "expert_sync_event_count", self.expert_sync_event_count
@@ -539,6 +556,9 @@ class CDCOptimizer(MegatronOptimizer):
             )
             tracker["moe_module_key"] = shard_state.get(
                 "moe_module_key", tracker.get("moe_module_key")
+            )
+            tracker["moe_layer_idx"] = shard_state.get(
+                "moe_layer_idx", tracker.get("moe_layer_idx")
             )
             tracker["local_expert_idx"] = shard_state.get(
                 "local_expert_idx", tracker.get("local_expert_idx")
@@ -814,6 +834,7 @@ class CDCOptimizer(MegatronOptimizer):
         pp_group,
         display_name: str,
         moe_module_key: Optional[str] = None,
+        moe_layer_idx: Optional[int] = None,
         local_expert_idx: Optional[int] = None,
         comm_dtype: Optional[torch.dtype] = None,
         apply_alpha: Optional[float] = None,
@@ -835,8 +856,10 @@ class CDCOptimizer(MegatronOptimizer):
             "last_score": 0.0,
             "last_token_load": 0.0,
             "token_load_accum": 0.0,
+            "token_load_step_accum": 0.0,
             "sent_at_expert_event": 0,
             "moe_module_key": moe_module_key,
+            "moe_layer_idx": moe_layer_idx,
             "local_expert_idx": local_expert_idx,
         }
 
@@ -885,6 +908,7 @@ class CDCOptimizer(MegatronOptimizer):
             tracker["last_score"] = 0.0
             tracker["last_token_load"] = 0.0
             tracker["token_load_accum"] = 0.0
+            tracker["token_load_step_accum"] = 0.0
             tracker["sent_at_expert_event"] = 0
 
             if tracker["outer_optimizer"] is not None:
@@ -901,6 +925,7 @@ class CDCOptimizer(MegatronOptimizer):
         self.step_count = 0
         self.next_shard_idx = 0
         self.next_expert_group_idx = 0
+        self.next_expert_layer_idx = 0
         self.expert_sync_event_count = 0
 
         if self.algorithm == 'diloco' and getattr(self, "original_snapshot", None) is not None:
@@ -1036,6 +1061,9 @@ class CDCOptimizer(MegatronOptimizer):
         self.next_shard_idx = 0
         self.expert_shard_tracker = {}
         self.next_expert_group_idx = 0
+        self.next_expert_layer_idx = 0
+        self._expert_layer_to_tracker_indices = {}
+        self._expert_layer_order = []
 
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
@@ -1090,7 +1118,7 @@ class CDCOptimizer(MegatronOptimizer):
                 sorted(expert_groups.keys(), key=self._expert_group_sort_key)
             ):
                 expert_param_refs = [param for _, param in expert_groups[expert_group_name]]
-                moe_module_key, _, local_expert_idx = self._extract_expert_group_metadata(
+                moe_module_key, moe_layer_idx, local_expert_idx = self._extract_expert_group_metadata(
                     expert_group_name
                 )
                 tracker = self._build_tracker(
@@ -1099,6 +1127,7 @@ class CDCOptimizer(MegatronOptimizer):
                     pp_group=pp_group,
                     display_name=expert_group_name,
                     moe_module_key=moe_module_key,
+                    moe_layer_idx=moe_layer_idx,
                     local_expert_idx=local_expert_idx,
                     apply_alpha=self.expert_alpha,
                     outer_lr=self.expert_outer_lr,
@@ -1114,12 +1143,41 @@ class CDCOptimizer(MegatronOptimizer):
                     if expert_idx < 8:
                         print_rank_0(
                             f"[CDC][MoETracker] group={expert_group_name} "
-                            f"module_key={moe_module_key} local_expert_idx={local_expert_idx}"
+                            f"module_key={moe_module_key} layer_idx={moe_layer_idx} "
+                            f"local_expert_idx={local_expert_idx}"
                         )
+            self._rebuild_expert_layer_index()
+            if self.expert_layerwise_selection and not self._expert_layer_order:
+                raise ValueError(
+                    "cdc_moe_expert_layerwise_selection requires layer ids in routed expert names."
+                )
+            if self.verbose and self.expert_layerwise_selection:
+                layer_summary = {
+                    layer_idx: len(indices)
+                    for layer_idx, indices in self._expert_layer_to_tracker_indices.items()
+                }
+                print_rank_0(
+                    f"[CDC][ExpertLayerwise] layers={self._expert_layer_order} "
+                    f"groups_per_layer={layer_summary}"
+                )
 
     @staticmethod
     def _tracker_has_any_params(tracker: Dict[str, Any]) -> bool:
         return bool(tracker.get("param_refs")) or bool(tracker.get("params"))
+
+    def _rebuild_expert_layer_index(self) -> None:
+        self._expert_layer_to_tracker_indices = {}
+        if not getattr(self, "expert_shard_tracker", None):
+            self._expert_layer_order = []
+            return
+
+        for idx, tracker in sorted(self.expert_shard_tracker.items()):
+            layer_idx = tracker.get("moe_layer_idx")
+            if layer_idx is None:
+                continue
+            self._expert_layer_to_tracker_indices.setdefault(int(layer_idx), []).append(idx)
+
+        self._expert_layer_order = sorted(self._expert_layer_to_tracker_indices.keys())
 
     @staticmethod
     def _parse_layer_index(param_name: str) -> Optional[int]:
@@ -1242,95 +1300,118 @@ class CDCOptimizer(MegatronOptimizer):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
         return [float(v) for v in tensor.cpu().tolist()]
 
-    def _collect_current_expert_token_loads(self) -> Dict[int, float]:
-        if not self.enable_moe_expert_refresh or not getattr(self, "expert_shard_tracker", None):
-            return {}
+    def _register_token_load_expert_hooks(self) -> None:
+        if not getattr(self, "expert_shard_tracker", None):
+            return
 
-        module_load_cache: Dict[str, List[float]] = {}
-        loads: Dict[int, float] = {}
-
+        module_to_tracker_indices: Dict[str, List[int]] = {}
         for tracker_idx, tracker in self.expert_shard_tracker.items():
             module_key = tracker.get("moe_module_key")
             local_expert_idx = tracker.get("local_expert_idx")
-            load_value = 0.0
+            if module_key is None or local_expert_idx is None:
+                continue
+            module_to_tracker_indices.setdefault(module_key, []).append(tracker_idx)
 
-            if module_key is not None and local_expert_idx is not None:
-                if module_key not in module_load_cache:
-                    module = self._lookup_moe_module(module_key)
-                    expert_loads: List[float] = []
-                    if module is not None:
-                        token_dispatcher = getattr(module, "token_dispatcher", None)
-                        load_tensor = None
-                        if token_dispatcher is not None:
-                            local_map = getattr(token_dispatcher, "local_map", None)
-                            if torch.is_tensor(local_map):
-                                load_tensor = local_map.sum(dim=0)
-                            load_tensor = getattr(
-                                token_dispatcher, "num_global_tokens_per_local_expert", None
-                            ) if load_tensor is None else load_tensor
-                            if load_tensor is None:
-                                load_tensor = getattr(
-                                    token_dispatcher, "num_global_tokens_per_local_expert_cpu", None
-                                )
-                            if load_tensor is None:
-                                load_tensor = getattr(token_dispatcher, "tokens_per_expert", None)
-                            if load_tensor is None and hasattr(
-                                token_dispatcher, "get_number_of_tokens_per_expert"
-                            ):
-                                getter = getattr(token_dispatcher, "get_number_of_tokens_per_expert")
-                                if callable(getter):
-                                    load_tensor = getter()
+        self._token_load_module_to_tracker_indices = module_to_tracker_indices
+        hooked_count = 0
 
-                        expert_loads = self._tensor_like_to_float_list(load_tensor)
-                        if self.verbose and not self._token_load_source_debug_printed:
-                            dispatcher_fields = {
-                                "module_key": module_key,
-                                "dispatcher_type": type(token_dispatcher).__name__
-                                if token_dispatcher is not None
-                                else "None",
-                                "has_num_global_tokens_per_local_expert": hasattr(
-                                    token_dispatcher, "num_global_tokens_per_local_expert"
-                                )
-                                if token_dispatcher is not None
-                                else False,
-                                "has_num_global_tokens_per_local_expert_cpu": hasattr(
-                                    token_dispatcher, "num_global_tokens_per_local_expert_cpu"
-                                )
-                                if token_dispatcher is not None
-                                else False,
-                                "has_tokens_per_expert": hasattr(
-                                    token_dispatcher, "tokens_per_expert"
-                                )
-                                if token_dispatcher is not None
-                                else False,
-                                "load_len": len(expert_loads),
-                                "load_sum": float(sum(expert_loads)) if expert_loads else 0.0,
-                                "load_preview": expert_loads[:8],
-                            }
-                            print_rank_0(f"[CDC][TokenLoadSource] {dispatcher_fields}")
-                            self._token_load_source_debug_printed = True
-                    module_load_cache[module_key] = expert_loads
+        for module_key in sorted(module_to_tracker_indices.keys()):
+            module = self._lookup_moe_module(module_key)
+            experts_module = getattr(module, "experts", None) if module is not None else None
+            if experts_module is None or not hasattr(experts_module, "register_forward_pre_hook"):
+                continue
 
-                expert_loads = module_load_cache.get(module_key, [])
-                if 0 <= int(local_expert_idx) < len(expert_loads):
-                    load_value = float(expert_loads[int(local_expert_idx)])
+            experts_module_id = id(experts_module)
+            if experts_module_id in self._token_load_hooked_expert_module_ids:
+                continue
 
-            loads[tracker_idx] = load_value
+            def token_load_pre_hook(
+                hook_module,
+                inputs,
+                _module_key=module_key,
+            ):
+                if torch.is_grad_enabled():
+                    self._accumulate_token_load_from_expert_inputs(
+                        _module_key, hook_module, inputs
+                    )
 
-        return loads
+            handle = experts_module.register_forward_pre_hook(token_load_pre_hook)
+            self._token_load_hooked_expert_module_ids.add(experts_module_id)
+            self._token_load_hook_handles.append(handle)
+            hooked_count += 1
 
-    def _update_moe_expert_token_load_stats(self) -> None:
+        if self.verbose:
+            print_rank_0(
+                f"[CDC][TokenLoadSource] source=experts_forward_pre_hook "
+                f"hooked_modules={hooked_count} tracked_modules={len(module_to_tracker_indices)}"
+            )
+
+    def _accumulate_token_load_from_expert_inputs(
+        self, module_key: str, experts_module: Any, inputs: Any
+    ) -> None:
+        if not self.track_expert_token_load:
+            return
+        if not isinstance(inputs, (tuple, list)) or len(inputs) < 2:
+            return
+
+        expert_loads = self._tensor_like_to_float_list(inputs[1])
+        if not expert_loads:
+            return
+
+        for tracker_idx in self._token_load_module_to_tracker_indices.get(module_key, []):
+            tracker = self.expert_shard_tracker[tracker_idx]
+            local_expert_idx = tracker.get("local_expert_idx")
+            if local_expert_idx is None:
+                continue
+            local_expert_idx = int(local_expert_idx)
+            if 0 <= local_expert_idx < len(expert_loads):
+                load_value = float(expert_loads[local_expert_idx])
+                tracker["token_load_step_accum"] = float(
+                    tracker.get("token_load_step_accum", 0.0) + load_value
+                )
+
+        if self.verbose and not self._token_load_source_debug_printed:
+            print_rank_0(
+                "[CDC][TokenLoadSource] "
+                f"module_key={module_key} "
+                f"experts_type={type(experts_module).__name__} "
+                f"load_len={len(expert_loads)} "
+                f"load_sum={float(sum(expert_loads)):.6e} "
+                f"load_preview={expert_loads[:8]}"
+            )
+            self._token_load_source_debug_printed = True
+
+    def _commit_moe_expert_token_load_stats(self) -> None:
         if not self.track_expert_token_load:
             return
 
-        current_loads = self._collect_current_expert_token_loads()
-        if not current_loads:
-            return
+        step_load_sum = 0.0
+        accum_load_sum = 0.0
+        for tracker in self.expert_shard_tracker.values():
+            step_load = float(tracker.get("token_load_step_accum", 0.0))
+            tracker["last_token_load"] = step_load
+            tracker["token_load_accum"] = float(
+                tracker.get("token_load_accum", 0.0) + step_load
+            )
+            tracker["token_load_step_accum"] = 0.0
+            step_load_sum += step_load
+            accum_load_sum += float(tracker.get("token_load_accum", 0.0))
 
-        for tracker_idx, load_value in current_loads.items():
-            tracker = self.expert_shard_tracker[tracker_idx]
-            tracker["last_token_load"] = float(load_value)
-            tracker["token_load_accum"] = float(tracker.get("token_load_accum", 0.0) + load_value)
+        if self.verbose and not self._token_load_step_debug_printed:
+            print_rank_0(
+                f"[CDC][TokenLoadStep] step={self.step_count} "
+                f"source=experts_forward_pre_hook "
+                f"tracked_experts={len(getattr(self, 'expert_shard_tracker', {}))} "
+                f"step_load_sum_local={step_load_sum:.6e} "
+                f"accum_load_sum_local={accum_load_sum:.6e}"
+            )
+            self._token_load_step_debug_printed = True
+
+    def _discard_pending_moe_expert_token_load_stats(self) -> None:
+        if not self.track_expert_token_load:
+            return
+        for tracker in self.expert_shard_tracker.values():
+            tracker["token_load_step_accum"] = 0.0
 
     @torch.no_grad()
     def step(self):
@@ -1346,16 +1427,8 @@ class CDCOptimizer(MegatronOptimizer):
 
         if update_successful:
             self.step_count += 1
-            if self.verbose and not self._token_load_step_debug_printed:
-                print_rank_0(
-                    f"[CDC][TokenLoadStep] step={self.step_count} "
-                    f"track_expert_token_load={self.track_expert_token_load} "
-                    f"enable_moe_expert_refresh={self.enable_moe_expert_refresh} "
-                    f"expert_tracker_count={len(getattr(self, 'expert_shard_tracker', {}))}"
-                )
-                self._token_load_step_debug_printed = True
             if self.track_expert_token_load:
-                self._update_moe_expert_token_load_stats()
+                self._commit_moe_expert_token_load_stats()
 
             # 2. Outer Step
             if self.algorithm == 'diloco':
@@ -1370,6 +1443,8 @@ class CDCOptimizer(MegatronOptimizer):
             elif self.algorithm in ['streaming', 'dc']:
                 # Always check pending receives to respect per-step delay semantics.
                 self._sync_streaming()
+        elif self.track_expert_token_load:
+            self._discard_pending_moe_expert_token_load_stats()
 
         return update_successful, grad_norm, num_zeros_in_grad
 
@@ -1424,18 +1499,8 @@ class CDCOptimizer(MegatronOptimizer):
             self._initiate_tracker_sync(
                 self.shard_tracker, shard_idx, tracker_kind='dense-shard'
             )
-            if self.enable_moe_router_refresh:
-                router_tracker = self.router_tracker.get(0)
-                if router_tracker is not None and router_tracker.get("next_receive_step", 0) <= self.step_count:
-                    self._initiate_tracker_sync(
-                        self.router_tracker, 0, tracker_kind='router'
-                    )
-                elif self.verbose:
-                    print_rank_0(
-                        f"[CDC] Step {self.step_count}: Skip router sync because previous "
-                        f"router sync is still in flight until step "
-                        f"{router_tracker.get('next_receive_step', 0) if router_tracker is not None else 0}."
-                    )
+            if self.router_sync_mode == 'dense':
+                self._try_initiate_router_sync(sync_reason='dense')
             return
 
         if self._should_sync_expert_group():
@@ -1452,6 +1517,8 @@ class CDCOptimizer(MegatronOptimizer):
                         defer_completion=batch_immediate_completion,
                     )
                 self.expert_sync_event_count = expert_event_index
+                if self.router_sync_mode == 'expert':
+                    self._try_initiate_router_sync(sync_reason='expert')
                 if batch_immediate_completion:
                     self._complete_tracker_sync_batch(
                         self.expert_shard_tracker,
@@ -1460,6 +1527,22 @@ class CDCOptimizer(MegatronOptimizer):
                     )
                     for expert_group_idx in expert_group_indices:
                         self.expert_shard_tracker[expert_group_idx]["next_receive_step"] = 0
+
+    def _try_initiate_router_sync(self, *, sync_reason: str) -> None:
+        if not self.enable_moe_router_refresh:
+            return
+
+        router_tracker = self.router_tracker.get(0)
+        if router_tracker is not None and router_tracker.get("next_receive_step", 0) <= self.step_count:
+            self._initiate_tracker_sync(
+                self.router_tracker, 0, tracker_kind='router'
+            )
+        elif self.verbose:
+            print_rank_0(
+                f"[CDC] Step {self.step_count}: Skip router sync on {sync_reason} slot "
+                f"because previous router sync is still in flight until step "
+                f"{router_tracker.get('next_receive_step', 0) if router_tracker is not None else 0}."
+            )
 
     @torch.no_grad()
     def _run_blocking_full_sync(self) -> None:
@@ -1686,6 +1769,7 @@ class CDCOptimizer(MegatronOptimizer):
             if expert_event_index is not None:
                 tracker["sent_at_expert_event"] = int(expert_event_index)
             tracker["token_load_accum"] = 0.0
+            tracker["token_load_step_accum"] = 0.0
         tracker["next_receive_step"] = 0
 
     def _select_next_shard(self):
@@ -1861,6 +1945,31 @@ class CDCOptimizer(MegatronOptimizer):
             combined_scores[idx] = 0.5 * update_component + 0.5 * token_component
         return combined_scores
 
+    def _select_layerwise_expert_candidates(
+        self, candidate_indices: List[int]
+    ) -> Tuple[List[int], Optional[int]]:
+        if not self.expert_layerwise_selection:
+            return candidate_indices, None
+        if not self._expert_layer_order:
+            return candidate_indices, None
+
+        candidate_set = set(candidate_indices)
+        layer_count = len(self._expert_layer_order)
+        start_pos = self.next_expert_layer_idx % layer_count
+        for offset in range(layer_count):
+            layer_pos = (start_pos + offset) % layer_count
+            layer_idx = self._expert_layer_order[layer_pos]
+            layer_candidates = [
+                idx
+                for idx in self._expert_layer_to_tracker_indices.get(layer_idx, [])
+                if idx in candidate_set
+            ]
+            if layer_candidates:
+                self.next_expert_layer_idx = (layer_pos + 1) % layer_count
+                return layer_candidates, layer_idx
+
+        return [], None
+
     def _collect_expert_selection_debug_state(
         self,
         *,
@@ -1939,6 +2048,7 @@ class CDCOptimizer(MegatronOptimizer):
         selected_reasons: Dict[int, str],
         selection_score_all: Dict[int, float],
         selection_score_used: Dict[int, float],
+        layer_scope: Optional[int] = None,
     ) -> None:
         if not self.verbose or not self.expert_shard_tracker:
             return
@@ -1957,6 +2067,7 @@ class CDCOptimizer(MegatronOptimizer):
             f"event={upcoming_event}, mode={self.expert_selection}, "
             f"score_mode={self.expert_score_mode}, topk={self.expert_topk}, "
             f"available_count={len(candidate_indices)}, min_age_slots={self.expert_min_age_slots}, "
+            f"layerwise={int(self.expert_layerwise_selection)}, layer_scope={layer_scope}, "
             f"selected={selected}"
         )
 
@@ -2010,11 +2121,14 @@ class CDCOptimizer(MegatronOptimizer):
             return []
 
         all_indices = sorted(self.expert_shard_tracker.keys())
-        candidate_indices = [
+        global_candidate_indices = [
             idx
             for idx, tracker in self.expert_shard_tracker.items()
             if self._expert_tracker_is_available(tracker)
         ]
+        candidate_indices, layer_scope = self._select_layerwise_expert_candidates(
+            global_candidate_indices
+        )
         if not candidate_indices:
             return []
 
@@ -2031,6 +2145,7 @@ class CDCOptimizer(MegatronOptimizer):
             limit=max_select,
             selected=selected_set,
             require_unsent=True,
+            eligible_indices=set(candidate_indices),
         )
         for idx in unsent:
             selected.append(idx)
@@ -2073,6 +2188,7 @@ class CDCOptimizer(MegatronOptimizer):
                 selected_reasons=selected_reasons,
                 selection_score_all=selection_score_all,
                 selection_score_used=selection_score_used,
+                layer_scope=layer_scope,
             )
             return selected
 
@@ -2103,6 +2219,7 @@ class CDCOptimizer(MegatronOptimizer):
                 selected_reasons=selected_reasons,
                 selection_score_all=selection_score_all,
                 selection_score_used=selection_score_used,
+                layer_scope=layer_scope,
             )
             return selected
 
@@ -2124,6 +2241,7 @@ class CDCOptimizer(MegatronOptimizer):
             selected_reasons=selected_reasons,
             selection_score_all=selection_score_all,
             selection_score_used=selection_score_used,
+            layer_scope=layer_scope,
         )
         return selected
 
@@ -2164,6 +2282,7 @@ class CDCOptimizer(MegatronOptimizer):
             if expert_event_index is not None:
                 tracker["sent_at_expert_event"] = int(expert_event_index)
             tracker["token_load_accum"] = 0.0
+            tracker["token_load_step_accum"] = 0.0
 
         # Schedule receive
         tracker["next_receive_step"] = self.step_count + self.delay
