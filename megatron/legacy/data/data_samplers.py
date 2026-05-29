@@ -11,12 +11,36 @@ from megatron.training import get_args
 from megatron.core import mpu
 
 
+_DATA_SAMPLER_INFO_LOGGED = False
+
+
+def _log_data_sampler_info_once():
+    global _DATA_SAMPLER_INFO_LOGGED
+    if _DATA_SAMPLER_INFO_LOGGED:
+        return
+    _DATA_SAMPLER_INFO_LOGGED = True
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        global_rank = torch.distributed.get_rank()
+    else:
+        global_rank = 0
+    print(
+        '[DataSampler] '
+        f'global_rank={global_rank} '
+        f'dp_rank={mpu.get_data_parallel_rank()} '
+        f'dp_world={mpu.get_data_parallel_world_size()} '
+        f'sampler_rank={mpu.get_data_sampler_rank()} '
+        f'sampler_world={mpu.get_data_sampler_world_size()}',
+        flush=True,
+    )
+
+
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
 
     if dataset is None:
         return None
     args = get_args()
+    _log_data_sampler_info_once()
 
     # Megatron sampler
     if args.dataloader_type == 'single':

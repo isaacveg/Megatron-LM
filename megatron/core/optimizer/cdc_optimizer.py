@@ -43,33 +43,29 @@ class CDCOptimizer(MegatronOptimizer):
         self.algorithm = args.cdc_algorithm
         self.offload_outer_opt = args.cdc_offload_outer_opt
         self.outer_lr = float(args.cdc_outer_lr)
-        self.dense_outer_lr_arg = float(getattr(args, "cdc_dense_outer_lr", -1.0))
-        self.expert_outer_lr_arg = float(getattr(args, "cdc_moe_expert_outer_lr", -1.0))
-        self.dense_outer_lr = self._resolve_component_outer_lr(
-            self.dense_outer_lr_arg, "cdc_dense_outer_lr"
+        self.dense_outer_lr_arg = float(args.cdc_dense_outer_lr)
+        self.expert_outer_lr_arg = float(args.cdc_moe_expert_outer_lr)
+        self.dense_outer_lr = (
+            self.outer_lr if self.dense_outer_lr_arg < 0.0 else self.dense_outer_lr_arg
         )
-        self.expert_outer_lr = self._resolve_component_outer_lr(
-            self.expert_outer_lr_arg, "cdc_moe_expert_outer_lr"
+        self.expert_outer_lr = (
+            self.outer_lr if self.expert_outer_lr_arg < 0.0 else self.expert_outer_lr_arg
         )
         self.num_shards = args.cdc_num_shards
         self.dc_lambda = args.cdc_dc_lambda
         self.streaming_alpha = float(args.cdc_streaming_alpha)
-        if self.streaming_alpha < 0.0 or self.streaming_alpha > 1.0:
-            raise ValueError(
-                f"cdc_streaming_alpha must be in [0, 1], got {self.streaming_alpha}"
-            )
-        self.dense_alpha_arg = float(getattr(args, "cdc_dense_alpha", -1.0))
+        self.dense_alpha_arg = float(args.cdc_dense_alpha)
         self.router_alpha_arg = float(args.cdc_moe_router_alpha)
-        self.expert_alpha_arg = float(getattr(args, "cdc_moe_expert_alpha", -1.0))
+        self.expert_alpha_arg = float(args.cdc_moe_expert_alpha)
         self.router_sync_mode = str(args.cdc_moe_router_sync_mode).lower()
-        self.dense_alpha = self._resolve_component_alpha(
-            self.dense_alpha_arg, "cdc_dense_alpha"
+        self.dense_alpha = (
+            self.streaming_alpha if self.dense_alpha_arg < 0.0 else self.dense_alpha_arg
         )
-        self.router_alpha = self._resolve_component_alpha(
-            self.router_alpha_arg, "cdc_moe_router_alpha"
+        self.router_alpha = (
+            self.streaming_alpha if self.router_alpha_arg < 0.0 else self.router_alpha_arg
         )
-        self.expert_alpha = self._resolve_component_alpha(
-            self.expert_alpha_arg, "cdc_moe_expert_alpha"
+        self.expert_alpha = (
+            self.streaming_alpha if self.expert_alpha_arg < 0.0 else self.expert_alpha_arg
         )
         self.delay = args.cdc_delay
         self.dc_N = args.cdc_dc_N
@@ -83,7 +79,6 @@ class CDCOptimizer(MegatronOptimizer):
         self.expert_layerwise_selection = bool(args.cdc_moe_expert_layerwise_selection)
         self.expert_max_age_slots = int(args.cdc_moe_expert_max_age_slots)
         self.expert_min_age_slots = int(args.cdc_moe_expert_min_age_slots)
-        self.expert_max_staleness = int(args.cdc_moe_expert_max_staleness)
         self.blocking_full_sync_steps = int(args.cdc_blocking_full_sync_steps)
         self.verbose = args.cdc_verbose
         self.mixed_precision = args.bf16 or args.fp16
@@ -146,37 +141,9 @@ class CDCOptimizer(MegatronOptimizer):
         self._expert_layer_to_tracker_indices: Dict[int, List[int]] = {}
         self._expert_layer_order: List[int] = []
 
-        if self.moe_param_mode == 'dense-expert-hybrid' and self.algorithm != 'streaming':
-            raise ValueError(
-                "cdc_moe_param_mode=dense-expert-hybrid currently only supports "
-                "cdc_algorithm=streaming."
-            )
-        if self.expert_topk < 1:
-            raise ValueError(f"cdc_moe_expert_topk must be >= 1, got {self.expert_topk}")
-        if self.expert_min_age_slots < 0:
-            raise ValueError(
-                f"cdc_moe_expert_min_age_slots must be >= 0, got {self.expert_min_age_slots}"
-            )
-        if self.blocking_full_sync_steps < 0:
-            raise ValueError(
-                f"cdc_blocking_full_sync_steps must be >= 0, got {self.blocking_full_sync_steps}"
-            )
-        if self.expert_selection not in {'round_robin', 'score'}:
-            raise ValueError(
-                f"Unknown cdc_moe_expert_selection: {self.expert_selection}"
-            )
-        if self.expert_score_mode not in {'update_norm', 'token_load', 'mixed'}:
-            raise ValueError(
-                f"Unknown cdc_moe_expert_score_mode: {self.expert_score_mode}"
-            )
         if self.enable_moe_expert_refresh and int(args.expert_model_parallel_size) != 1:
             raise NotImplementedError(
                 "dense-expert-hybrid currently supports expert_model_parallel_size=1 only."
-            )
-        if self.algorithm == 'diloco' and self.blocking_full_sync_steps > 0:
-            raise ValueError(
-                "cdc_blocking_full_sync_steps is only supported for streaming/DC CDC runs. "
-                "diloco already performs a blocking full sync via cdc_sync_interval."
             )
 
         self._moe_module_index = (
@@ -193,15 +160,15 @@ class CDCOptimizer(MegatronOptimizer):
                 f"[CDC] Initialized {self.algorithm} optimizer. Sync interval: "
                 f"{self.sync_interval}, Shards: {self.num_shards}, "
                 f"outer_lr={self.outer_lr}, "
-                f"dense_outer_lr={self._format_component_value(self.dense_outer_lr_arg, self.dense_outer_lr)}, "
-                f"expert_outer_lr={self._format_component_value(self.expert_outer_lr_arg, self.expert_outer_lr)}, "
+                f"dense_outer_lr={'inherit(' + str(self.dense_outer_lr) + ')' if self.dense_outer_lr_arg < 0.0 else self.dense_outer_lr}, "
+                f"expert_outer_lr={'inherit(' + str(self.expert_outer_lr) + ')' if self.expert_outer_lr_arg < 0.0 else self.expert_outer_lr}, "
                 f"outer_state_dtype={self.outer_state_dtype}, outer_comm_dtype={self.outer_comm_dtype}, "
                 f"moe_param_mode={self.moe_param_mode}, "
-                f"dense_alpha={self._format_component_alpha(self.dense_alpha_arg, self.dense_alpha)}, "
+                f"dense_alpha={'inherit(' + str(self.dense_alpha) + ')' if self.dense_alpha_arg < 0.0 else self.dense_alpha}, "
                 f"router_refresh={self.router_sync_mode if self.enable_moe_router_refresh else 'off'}, "
-                f"router_alpha={self._format_component_alpha(self.router_alpha_arg, self.router_alpha)}, "
+                f"router_alpha={'inherit(' + str(self.router_alpha) + ')' if self.router_alpha_arg < 0.0 else self.router_alpha}, "
                 f"expert_refresh={'on' if self.enable_moe_expert_refresh else 'off'}, "
-                f"expert_alpha={self._format_component_alpha(self.expert_alpha_arg, self.expert_alpha)}, "
+                f"expert_alpha={'inherit(' + str(self.expert_alpha) + ')' if self.expert_alpha_arg < 0.0 else self.expert_alpha}, "
                 f"expert_topk={self.expert_topk}, expert_score_mode={self.expert_score_mode}, "
                 f"expert_layerwise_selection={self.expert_layerwise_selection}, "
                 f"expert_min_age_slots={self.expert_min_age_slots}, "
@@ -217,28 +184,6 @@ class CDCOptimizer(MegatronOptimizer):
 
         if self.track_expert_token_load:
             self._register_token_load_expert_hooks()
-
-    def _resolve_component_alpha(self, alpha_value: float, arg_name: str) -> float:
-        """Resolve per-component alpha; negative values inherit cdc_streaming_alpha."""
-        if alpha_value < 0.0:
-            return self.streaming_alpha
-        if alpha_value > 1.0:
-            raise ValueError(f"{arg_name} must be <= 1.0, got {alpha_value}")
-        return float(alpha_value)
-
-    def _resolve_component_outer_lr(self, lr_value: float, arg_name: str) -> float:
-        """Resolve per-component outer LR; negative values inherit cdc_outer_lr."""
-        if lr_value < 0.0:
-            return self.outer_lr
-        return float(lr_value)
-
-    @staticmethod
-    def _format_component_value(raw_value: float, effective_value: float) -> str:
-        if raw_value < 0.0:
-            return f"inherit({effective_value})"
-        return str(effective_value)
-
-    _format_component_alpha = _format_component_value
 
     @property
     def is_stub_optimizer(self):
@@ -266,20 +211,11 @@ class CDCOptimizer(MegatronOptimizer):
         """返回遍历model_chunks后保存到一个展平列表的params
         named_parameters()会自动去重
         """
-        if hasattr(self, "_named_model_param_list"):
-            return [p for _, p in self._named_model_param_list]
-        model_param_list = []
-        for chunk in self.model_chunks:
-            for name, p in chunk.named_parameters():
-                if p.requires_grad:
-                    model_param_list.append(p)
-        return model_param_list
+        return [p for _, p in self._named_model_param_list]
 
     @property
     def tracked_model_param_list(self):
-        if hasattr(self, "_tracked_named_model_params"):
-            return [p for _, p in self._tracked_named_model_params]
-        return self.model_param_list
+        return [p for _, p in self._tracked_named_model_params]
 
     def get_loss_scale(self):
         return self.inner_optimizer.get_loss_scale()
@@ -727,45 +663,22 @@ class CDCOptimizer(MegatronOptimizer):
     def _lookup_moe_module(self, module_key: str) -> Optional[torch.nn.Module]:
         if not module_key:
             return None
-        module = self._moe_module_index.get(module_key)
-        if module is not None:
-            return module
-
-        suffix_matches = [
-            candidate_module
-            for candidate_key, candidate_module in self._moe_module_index.items()
-            if candidate_key.endswith(module_key) or module_key.endswith(candidate_key)
-        ]
-        if len(suffix_matches) == 1:
-            return suffix_matches[0]
-        return None
+        return self._moe_module_index.get(module_key)
 
     @staticmethod
-    def _tensor_like_to_float_list(value: Any) -> List[float]:
-        if value is None:
-            return []
+    def _tokens_per_expert_to_float_list(value: Any) -> List[float]:
         if torch.is_tensor(value):
+            if value.dim() != 1:
+                raise ValueError(
+                    f"Expected tokens_per_expert to be a 1-D tensor, got shape {tuple(value.shape)}."
+                )
             tensor = value.detach().to(dtype=torch.float32)
-            if tensor.dim() == 1:
-                return [float(v) for v in tensor.cpu().tolist()]
-            reduced = tensor.reshape(-1, tensor.shape[-1]).sum(dim=0)
-            return [float(v) for v in reduced.cpu().tolist()]
+            return [float(v) for v in tensor.cpu().tolist()]
         if isinstance(value, (list, tuple)):
+            if any(isinstance(item, (list, tuple)) for item in value):
+                raise ValueError("Expected tokens_per_expert to be a flat list or tuple.")
             return [float(v) for v in value]
-        if hasattr(value, "tolist"):
-            raw = value.tolist()
-            if isinstance(raw, list):
-                if raw and isinstance(raw[0], list):
-                    if not raw[0]:
-                        return []
-                    cols = len(raw[0])
-                    reduced = [0.0 for _ in range(cols)]
-                    for row in raw:
-                        for idx, item in enumerate(row):
-                            reduced[idx] += float(item)
-                    return reduced
-                return [float(v) for v in raw]
-        return []
+        raise TypeError(f"Expected tokens_per_expert tensor/list/tuple, got {type(value).__name__}.")
 
     def _filter_named_params_for_cdc(
         self, named_params: List[Tuple[str, torch.nn.Parameter]]
@@ -1187,10 +1100,7 @@ class CDCOptimizer(MegatronOptimizer):
         m = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", param_name)
         if m is None:
             return None
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
+        return int(m.group(1))
 
     @staticmethod
     def _is_embedding_param_name(param_name: str) -> bool:
@@ -1230,7 +1140,7 @@ class CDCOptimizer(MegatronOptimizer):
 
         # 3) Misc (final norm, output bias, etc.)
         # Keep embeddings isolated: place misc into the last shard if possible.
-        return max(self.num_shards - 1, 0)
+        return self.num_shards - 1
 
     def _layer_to_decoder_shard(self, layer_idx: int, num_layers: int, decoder_shards: int) -> int:
         if decoder_shards <= 0:
@@ -1273,10 +1183,7 @@ class CDCOptimizer(MegatronOptimizer):
     def _all_reduce_scalar_sum(self, value: float, group) -> float:
         if group is None:
             return float(value)
-        try:
-            if dist.get_world_size(group=group) <= 1:
-                return float(value)
-        except Exception:
+        if dist.get_world_size(group=group) <= 1:
             return float(value)
 
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -1289,10 +1196,7 @@ class CDCOptimizer(MegatronOptimizer):
             return []
         if group is None:
             return [float(v) for v in values]
-        try:
-            if dist.get_world_size(group=group) <= 1:
-                return [float(v) for v in values]
-        except Exception:
+        if dist.get_world_size(group=group) <= 1:
             return [float(v) for v in values]
 
         device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -1319,7 +1223,9 @@ class CDCOptimizer(MegatronOptimizer):
             module = self._lookup_moe_module(module_key)
             experts_module = getattr(module, "experts", None) if module is not None else None
             if experts_module is None or not hasattr(experts_module, "register_forward_pre_hook"):
-                continue
+                raise ValueError(
+                    f"Could not register CDC token-load hook for MoE module {module_key!r}."
+                )
 
             experts_module_id = id(experts_module)
             if experts_module_id in self._token_load_hooked_expert_module_ids:
@@ -1354,7 +1260,7 @@ class CDCOptimizer(MegatronOptimizer):
         if not isinstance(inputs, (tuple, list)) or len(inputs) < 2:
             return
 
-        expert_loads = self._tensor_like_to_float_list(inputs[1])
+        expert_loads = self._tokens_per_expert_to_float_list(inputs[1])
         if not expert_loads:
             return
 
@@ -1520,9 +1426,9 @@ class CDCOptimizer(MegatronOptimizer):
                 if self.router_sync_mode == 'expert':
                     self._try_initiate_router_sync(sync_reason='expert')
                 if batch_immediate_completion:
-                    self._complete_tracker_sync_batch(
+                    self._complete_tracker_sync(
                         self.expert_shard_tracker,
-                        expert_group_indices,
+                        tracker_indices=expert_group_indices,
                         tracker_kind='expert-group',
                     )
                     for expert_group_idx in expert_group_indices:
@@ -1657,21 +1563,11 @@ class CDCOptimizer(MegatronOptimizer):
 
         for event_id in sorted(due_event_to_trackers.keys()):
             tracker_indices = sorted(due_event_to_trackers[event_id])
-            if len(tracker_indices) == 1:
-                self._complete_tracker_sync(
-                    self.expert_shard_tracker,
-                    tracker_indices[0],
-                    tracker_kind='expert-group',
-                    reload_main_params=False,
-                )
-                if self.mixed_precision:
-                    self.inner_optimizer.reload_model_params()
-            else:
-                self._complete_tracker_sync_batch(
-                    self.expert_shard_tracker,
-                    tracker_indices,
-                    tracker_kind='expert-group',
-                )
+            self._complete_tracker_sync(
+                self.expert_shard_tracker,
+                tracker_indices=tracker_indices,
+                tracker_kind='expert-group',
+            )
 
             for tracker_idx in tracker_indices:
                 self.expert_shard_tracker[tracker_idx]["next_receive_step"] = 0
@@ -1845,12 +1741,6 @@ class CDCOptimizer(MegatronOptimizer):
             return 0
         return int(upcoming_event - sent_event)
 
-    def _expert_tracker_age_steps(self, tracker: Dict[str, Any]) -> int:
-        sent_step = int(tracker.get("sent_at_step", 0))
-        if sent_step <= 0:
-            return 0
-        return int(self.step_count - sent_step)
-
     def _expert_tracker_is_slot_stale(
         self, tracker: Dict[str, Any], upcoming_event: int
     ) -> bool:
@@ -1859,13 +1749,6 @@ class CDCOptimizer(MegatronOptimizer):
         if self._expert_tracker_is_unsent(tracker):
             return False
         return self._expert_tracker_age_slots(tracker, upcoming_event) >= self.expert_max_age_slots
-
-    def _expert_tracker_is_step_stale(self, tracker: Dict[str, Any]) -> bool:
-        if self.expert_max_staleness <= 0:
-            return False
-        if self._expert_tracker_is_unsent(tracker):
-            return False
-        return self._expert_tracker_age_steps(tracker) >= self.expert_max_staleness
 
     def _expert_tracker_is_min_age_blocked(
         self, tracker: Dict[str, Any], upcoming_event: int
@@ -2006,9 +1889,7 @@ class CDCOptimizer(MegatronOptimizer):
             sent_step = int(tracker.get("sent_at_step", 0))
             next_receive_step = int(tracker.get("next_receive_step", 0))
             age_slots = self._expert_tracker_age_slots(tracker, upcoming_event)
-            age_steps = self._expert_tracker_age_steps(tracker)
             slot_stale = self._expert_tracker_is_slot_stale(tracker, upcoming_event)
-            step_stale = self._expert_tracker_is_step_stale(tracker)
             min_age_blocked = self._expert_tracker_is_min_age_blocked(tracker, upcoming_event)
             denom = tracker["global_num_params"] if tracker["global_num_params"] > 0 else 1
             update_norm = math.sqrt(max(float(tracker["last_score"]), 0.0) / denom)
@@ -2023,9 +1904,7 @@ class CDCOptimizer(MegatronOptimizer):
                 "sent_at_expert_event": sent_event,
                 "next_receive_step": next_receive_step,
                 "age_slots": age_slots,
-                "age_steps": age_steps,
                 "slot_stale": slot_stale,
-                "step_stale": step_stale,
                 "min_age_blocked": min_age_blocked,
                 "last_score_norm_sq": float(tracker["last_score"]),
                 "update_norm": update_norm,
@@ -2103,9 +1982,7 @@ class CDCOptimizer(MegatronOptimizer):
                 f"sent_event={row['sent_at_expert_event']} "
                 f"next_recv={row['next_receive_step']} "
                 f"age_slots={row['age_slots']} "
-                f"age_steps={row['age_steps']} "
                 f"slot_stale={int(row['slot_stale'])} "
-                f"step_stale={int(row['step_stale'])} "
                 f"min_age_blocked={int(row['min_age_blocked'])} "
                 f"last_score_norm2={row['last_score_norm_sq']:.6e} "
                 f"update_norm={row['update_norm']:.6e} "
@@ -2153,30 +2030,23 @@ class CDCOptimizer(MegatronOptimizer):
             selected_reasons[idx] = 'mandatory_unsent'
 
         remaining = max_select - len(selected)
-        stale_candidates: List[Tuple[int, int, int, bool, bool]] = []
+        stale_candidates: List[Tuple[int, int]] = []
         if remaining > 0:
             for idx in candidate_indices:
                 if idx in selected_set:
                     continue
                 tracker = self.expert_shard_tracker[idx]
                 age_slots = self._expert_tracker_age_slots(tracker, upcoming_event)
-                age_steps = self._expert_tracker_age_steps(tracker)
                 slot_stale = self._expert_tracker_is_slot_stale(tracker, upcoming_event)
-                step_stale = self._expert_tracker_is_step_stale(tracker)
-                if slot_stale or step_stale:
-                    stale_candidates.append((age_slots, age_steps, idx, slot_stale, step_stale))
+                if slot_stale:
+                    stale_candidates.append((age_slots, idx))
 
             if stale_candidates:
-                stale_candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
-                for _, _, idx, slot_stale, step_stale in stale_candidates[:remaining]:
+                stale_candidates.sort(key=lambda item: (-item[0], item[1]))
+                for _, idx in stale_candidates[:remaining]:
                     selected.append(idx)
                     selected_set.add(idx)
-                    if slot_stale and step_stale:
-                        selected_reasons[idx] = 'stale_slot+step'
-                    elif slot_stale:
-                        selected_reasons[idx] = 'stale_slot'
-                    else:
-                        selected_reasons[idx] = 'stale_step'
+                    selected_reasons[idx] = 'stale_slot'
 
         remaining = max_select - len(selected)
         if remaining <= 0:
@@ -2297,104 +2167,27 @@ class CDCOptimizer(MegatronOptimizer):
     def _complete_tracker_sync(
         self,
         tracker_dict: Dict[int, Dict[str, Any]],
-        tracker_idx: int,
+        tracker_idx: Optional[int] = None,
         *,
+        tracker_indices: Optional[List[int]] = None,
         tracker_kind: str,
         reload_main_params: bool = True,
         use_algorithm_specific_update: bool = True,
         force_full_copy: bool = False,
     ) -> None:
-        """Complete the sync process for a tracker entry (receive & update)."""
-        tracker = tracker_dict[tracker_idx]
-        tracker_label = tracker.get("display_name", str(tracker_idx))
-        param_refs = tracker["param_refs"]
-        global_params = tracker["params"]
-        staged_params = tracker["staged_params"]
-
-        # 1. Calculate sync gradients (Global - Staged)
-        sync_grads = []
-        for p_global, p_staged in zip(global_params, staged_params):
-            # Global and Staged 一定在同一个设备上
-            g = p_global.data.clone()
-            g.sub_(p_staged.data)
-            sync_grads.append(g)
-
-        # 2. All-Reduce sync_grads (Across DiLoCo Islands)
-        self._all_reduce_flattened(
-            sync_grads,
-            communication_dtype=tracker.get("comm_dtype", self.outer_comm_dtype),
-        )
-
-        # 3. Calculate Score for Next Selection (Norm of Global Pseudo-Gradient)
-        total_norm_sq = 0.0
-        for g in sync_grads:
-            total_norm_sq += float(g.float().pow(2).sum().item())
-
-        # All-Reduce norm across TP group, then across PP group.
-        tp_group = mpu.get_tensor_model_parallel_group()
-        if tp_group is not None and dist.get_world_size(group=tp_group) > 1:
-            norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
-            dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=tp_group)
-            total_norm_sq = norm_tensor.item()
-
-        pp_group = mpu.get_pipeline_model_parallel_group()
-        if pp_group is not None and dist.get_world_size(group=pp_group) > 1:
-            # Use GPU tensor if available (sync_grads may be empty on some partitions; handle that).
-            norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
-            dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=pp_group)
-            total_norm_sq = norm_tensor.item()
-
-        tracker["last_score"] = total_norm_sq
-
-        if self.verbose:
-            duration = time.time() - tracker.get("sync_start_time", time.time())
-            print_rank_0(
-                f"[CDC] Step {self.step_count}: Completed sync for {tracker_kind} "
-                f"{tracker_label} in {duration:.4f}s. Score (Norm^2): {total_norm_sq:.4e}"
-            )
-
-        # 4. Outer Optimizer Step (Update Global)
-        if tracker["outer_optimizer"]:
-            if len(global_params) > 0:
-                for p_global, avg_delta in zip(global_params, sync_grads):
-                    if p_global.grad is None:
-                        p_global.grad = torch.zeros_like(p_global.data)
-                    p_global.grad.copy_(avg_delta)
-                tracker["outer_optimizer"].step()
-                tracker["outer_optimizer"].zero_grad(set_to_none=True)
-        else:
-            # Simple averaging
-            for p_global, avg_delta in zip(global_params, sync_grads):
-                p_global.data.sub_(avg_delta)
-
-        # 5. Update Local Params (Algorithm Specific)
-        if use_algorithm_specific_update and self.algorithm == 'dc' and tracker_kind == 'dense-shard':
-            self.delay_compensation(tracker)
-
-        else:
-            # Alpha blending for normal streaming receives; alpha=0 hard-overwrites local.
-            self._apply_global_params_to_local(tracker, force_full_copy=force_full_copy)
-
-        # Keep optimizer main params in sync with model params for mixed precision.
-        if self.mixed_precision and reload_main_params:
-            self.inner_optimizer.reload_model_params()
-
-    def _complete_tracker_sync_batch(
-        self,
-        tracker_dict: Dict[int, Dict[str, Any]],
-        tracker_indices: List[int],
-        *,
-        tracker_kind: str,
-    ) -> None:
+        """Complete one or more tracker syncs (receive & update)."""
+        if tracker_indices is None:
+            if tracker_idx is None:
+                return
+            tracker_indices = [tracker_idx]
         if not tracker_indices:
             return
 
-        tracker_entries: List[Tuple[Dict[str, Any], List[torch.nn.Parameter], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]] = []
+        tracker_entries: List[Tuple[int, Dict[str, Any], List[torch.Tensor], List[torch.Tensor]]] = []
         batched_sync_grads: List[torch.Tensor] = []
 
         for tracker_idx in tracker_indices:
             tracker = tracker_dict[tracker_idx]
-            param_refs = tracker["param_refs"]
             global_params = tracker["params"]
             staged_params = tracker["staged_params"]
 
@@ -2403,10 +2196,10 @@ class CDCOptimizer(MegatronOptimizer):
                 grad_tensor = p_global.data.clone()
                 grad_tensor.sub_(p_staged.data)
                 sync_grads.append(grad_tensor)
-            tracker_entries.append((tracker, param_refs, global_params, staged_params, sync_grads))
+            tracker_entries.append((tracker_idx, tracker, global_params, sync_grads))
             batched_sync_grads.extend(sync_grads)
 
-        batch_comm_dtype = tracker_entries[0][0].get("comm_dtype", self.outer_comm_dtype)
+        batch_comm_dtype = tracker_entries[0][1].get("comm_dtype", self.outer_comm_dtype)
         self._all_reduce_flattened(
             batched_sync_grads, communication_dtype=batch_comm_dtype
         )
@@ -2414,8 +2207,8 @@ class CDCOptimizer(MegatronOptimizer):
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
 
-        for tracker, param_refs, global_params, _, sync_grads in tracker_entries:
-            tracker_label = tracker.get("display_name", "unknown")
+        for entry_tracker_idx, tracker, global_params, sync_grads in tracker_entries:
+            tracker_label = tracker.get("display_name", str(entry_tracker_idx))
 
             total_norm_sq = 0.0
             for grad_tensor in sync_grads:
@@ -2440,21 +2233,23 @@ class CDCOptimizer(MegatronOptimizer):
                     f"{tracker_label} in {duration:.4f}s. Score (Norm^2): {total_norm_sq:.4e}"
                 )
 
-            if tracker["outer_optimizer"]:
-                if len(global_params) > 0:
-                    for p_global, avg_delta in zip(global_params, sync_grads):
-                        if p_global.grad is None:
-                            p_global.grad = torch.zeros_like(p_global.data)
-                        p_global.grad.copy_(avg_delta)
-                    tracker["outer_optimizer"].step()
-                    tracker["outer_optimizer"].zero_grad(set_to_none=True)
+            if tracker["outer_optimizer"] is not None:
+                for p_global, avg_delta in zip(global_params, sync_grads):
+                    if p_global.grad is None:
+                        p_global.grad = torch.zeros_like(p_global.data)
+                    p_global.grad.copy_(avg_delta)
+                tracker["outer_optimizer"].step()
+                tracker["outer_optimizer"].zero_grad(set_to_none=True)
             else:
                 for p_global, avg_delta in zip(global_params, sync_grads):
                     p_global.data.sub_(avg_delta)
 
-            self._apply_global_params_to_local(tracker)
+            if use_algorithm_specific_update and self.algorithm == 'dc' and tracker_kind == 'dense-shard':
+                self.delay_compensation(tracker)
+            else:
+                self._apply_global_params_to_local(tracker, force_full_copy=force_full_copy)
 
-        if self.mixed_precision:
+        if self.mixed_precision and reload_main_params:
             self.inner_optimizer.reload_model_params()
             
     def delay_compensation(self, tracker):
@@ -2471,7 +2266,7 @@ class CDCOptimizer(MegatronOptimizer):
         eps = 1e-8  # 数值稳定性
         args = get_args()
         lam0 = self.dc_lambda  # lambda base
-        lam_max = float(getattr(args, "cdc_dc_lambda_max", 10.0))  # 上限
+        lam_max = float(args.cdc_dc_lambda_max)  # 上限
 
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()

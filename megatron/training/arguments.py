@@ -847,8 +847,38 @@ def validate_args(args, defaults={}):
     if args.context_parallel_size > 1:
         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
 
+    # Cross-DataCenter (CDC) check
     if args.cdc_parallel_size > 1:
         assert args.use_cdc, "--cdc-parallel-size > 1 requires --use-cdc."
+
+    if args.use_cdc:
+        assert 0.0 <= args.cdc_streaming_alpha <= 1.0, \
+            f"--cdc-streaming-alpha must be in [0, 1], got {args.cdc_streaming_alpha}."
+        assert args.cdc_dense_alpha <= 1.0, \
+            f"--cdc-dense-alpha must be <= 1.0, got {args.cdc_dense_alpha}."
+        assert args.cdc_moe_router_alpha <= 1.0, \
+            f"--cdc-moe-router-alpha must be <= 1.0, got {args.cdc_moe_router_alpha}."
+        assert args.cdc_moe_expert_alpha <= 1.0, \
+            f"--cdc-moe-expert-alpha must be <= 1.0, got {args.cdc_moe_expert_alpha}."
+        assert args.cdc_moe_expert_topk >= 1, \
+            f"--cdc-moe-expert-topk must be >= 1, got {args.cdc_moe_expert_topk}."
+        assert args.cdc_moe_expert_min_age_slots >= 0, \
+            f"--cdc-moe-expert-min-age-slots must be >= 0, got {args.cdc_moe_expert_min_age_slots}."
+        assert args.cdc_blocking_full_sync_steps >= 0, \
+            f"--cdc-blocking-full-sync-steps must be >= 0, got {args.cdc_blocking_full_sync_steps}."
+        assert not (
+            args.cdc_moe_param_mode == 'dense-expert-hybrid'
+            and args.cdc_algorithm != 'streaming'
+        ), (
+            "--cdc-moe-param-mode=dense-expert-hybrid currently only supports "
+            "--cdc-algorithm=streaming."
+        )
+        assert not (
+            args.cdc_algorithm == 'diloco' and args.cdc_blocking_full_sync_steps > 0
+        ), (
+            "--cdc-blocking-full-sync-steps is only supported for streaming/DC CDC runs. "
+            "DiLoCo already performs a blocking full sync via --cdc-sync-interval."
+        )
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
@@ -2790,9 +2820,6 @@ def _add_cdc_args(parser):
                        help='For dense-expert-hybrid: minimum gap in expert-sync slots between two sends '
                             'of the same routed expert group during normal score/RR selection. '
                             'Mandatory first-send and stale-forced syncs ignore this bound. 0 disables it.')
-    group.add_argument('--cdc-moe-expert-max-staleness', type=int, default=0,
-                       help='For dense-expert-hybrid: max successful-step staleness before a routed expert '
-                            'group is forced to sync. 0 disables the step-based fallback cap.')
     group.add_argument('--cdc-verbose', action='store_true',
                        help='Enable verbose logging for CDC optimizer.')
 
