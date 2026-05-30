@@ -27,6 +27,45 @@ def test_cdc_size_one_does_not_rewrite_order_unless_explicit():
     assert explicit_cdc_generator.get_ranks("cdc") == [[0], [1], [2], [3]]
 
 
+def test_initialize_cdc_size_one_does_not_create_cdc_process_group(monkeypatch):
+    ps.destroy_model_parallel()
+    created_group_descs = []
+
+    def fake_create_group(
+        ranks=None,
+        timeout=None,
+        backend=None,
+        pg_options=None,
+        use_local_synchronization=False,
+        group_desc=None,
+    ):
+        created_group_descs.append(group_desc)
+        return object()
+
+    monkeypatch.setattr(ps.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(ps.torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(ps.torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(ps, "create_group", fake_create_group)
+
+    try:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            context_parallel_size=1,
+            cdc_parallel_size=1,
+            create_gloo_process_groups=False,
+        )
+
+        assert "CDC_PARALLEL_GROUP" not in created_group_descs
+        assert ps.get_cdc_parallel_group() is None
+        assert ps.get_cdc_parallel_world_size() == 1
+        assert ps.get_cdc_parallel_rank() == 0
+    finally:
+        ps.destroy_model_parallel()
+
+
 def test_cdc_rank_generator_adds_cdc_as_outer_dimension():
     rank_generator = ps.RankGenerator(
         tp=2, ep=1, dp=1, pp=2, cp=1, cdc=2, order="tp-cp-ep-pp-dp"

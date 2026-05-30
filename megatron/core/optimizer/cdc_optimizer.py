@@ -37,7 +37,16 @@ class CDCOptimizer(MegatronOptimizer):
         args = get_args()
         self.tie_embeddings = not args.untie_embeddings_and_output_weights
         # assert args.untie_embeddings_and_output_weights, "CDC does not support tied embeddings and output weights."
+        assert int(args.cdc_parallel_size) > 1, (
+            "CDCOptimizer requires cdc_parallel_size > 1. "
+            "Use the base optimizer when CDC parallelism is disabled."
+        )
+        cdc_world_size = mpu.get_cdc_parallel_world_size()
+        assert cdc_world_size > 1, (
+            "CDCOptimizer requires an initialized CDC parallel group with world size > 1."
+        )
         self.cdc_group = mpu.get_cdc_parallel_group()
+        assert self.cdc_group is not None, "CDCOptimizer requires a real CDC process group."
         self.sync_interval = args.cdc_sync_interval
         self.step_count = 0
         self.algorithm = args.cdc_algorithm

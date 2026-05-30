@@ -135,6 +135,7 @@ def _cdc_args(**overrides):
         decoder_num_layers=None,
         pipeline_model_parallel_size=1,
         expert_model_parallel_size=1,
+        cdc_parallel_size=2,
         cdc_dc_lambda_max=0.0,
     )
     for key, value in overrides.items():
@@ -148,6 +149,7 @@ def _patch_cdc_runtime(monkeypatch, CDCOptimizer, args):
 
     mpu = globals_dict["mpu"]
     monkeypatch.setattr(mpu, "get_cdc_parallel_group", lambda: "cdc", raising=False)
+    monkeypatch.setattr(mpu, "get_cdc_parallel_world_size", lambda: 2, raising=False)
     monkeypatch.setattr(mpu, "get_tensor_model_parallel_group", lambda: "tp", raising=False)
     monkeypatch.setattr(mpu, "get_pipeline_model_parallel_group", lambda: "pp", raising=False)
     monkeypatch.setattr(
@@ -373,6 +375,16 @@ def test_init_builds_global_identity_trackers_and_hooks(monkeypatch):
 
     for handle in optimizer._token_load_hook_handles:
         handle.remove()
+
+
+def test_init_rejects_cdc_parallel_size_one(monkeypatch):
+    CDCOptimizer = _load_cdc_optimizer_class()
+    args = _cdc_args(cdc_parallel_size=1)
+    _patch_cdc_runtime(monkeypatch, CDCOptimizer, args)
+
+    model = FakeChunk()
+    with pytest.raises(AssertionError, match="cdc_parallel_size > 1"):
+        CDCOptimizer(FakeInnerOptimizer([model]), model_chunks=[model])
 
 
 def test_old_streaming_layout_is_rejected_only_when_global_identity_is_required(

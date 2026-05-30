@@ -903,22 +903,25 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
-    cdc_rank_groups = (
-        generator_wrapper('cdc') if cdc_parallel_size > 1 else ([r] for r in range(world_size))
-    )
-    for cdc_ranks in cdc_rank_groups:
-        assert len(cdc_ranks) == cdc_parallel_size
-        group = create_group(
-            cdc_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options('cdc', nccl_comm_cfgs),
-            group_desc='CDC_PARALLEL_GROUP',
-        )
-        if rank in cdc_ranks:
-            _CDC_PARALLEL_GROUP = group
-            _CDC_PARALLEL_GLOBAL_RANKS = cdc_ranks
-            _MPU_CDC_PARALLEL_WORLD_SIZE = len(cdc_ranks)
-            _MPU_CDC_PARALLEL_RANK = cdc_ranks.index(rank)
+    if cdc_parallel_size > 1:
+        for cdc_ranks in generator_wrapper('cdc'):
+            assert len(cdc_ranks) == cdc_parallel_size
+            group = create_group(
+                cdc_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('cdc', nccl_comm_cfgs),
+                group_desc='CDC_PARALLEL_GROUP',
+            )
+            if rank in cdc_ranks:
+                _CDC_PARALLEL_GROUP = group
+                _CDC_PARALLEL_GLOBAL_RANKS = cdc_ranks
+                _MPU_CDC_PARALLEL_WORLD_SIZE = len(cdc_ranks)
+                _MPU_CDC_PARALLEL_RANK = cdc_ranks.index(rank)
+    else:
+        _CDC_PARALLEL_GROUP = None
+        _CDC_PARALLEL_GLOBAL_RANKS = [rank]
+        _MPU_CDC_PARALLEL_WORLD_SIZE = 1
+        _MPU_CDC_PARALLEL_RANK = 0
 
     assert (
         inner_data_parallel_size * context_parallel_size
@@ -1373,8 +1376,8 @@ def get_cdc_parallel_group():
     """Get the cross-DC (CDC) parallel group the caller rank belongs to.
 
     This group spans the outer data-parallel dimension across DC islands.
+    Returns None when CDC parallelism is disabled (cdc_parallel_size == 1).
     """
-    assert _CDC_PARALLEL_GROUP is not None, 'Cross-DC parallel group is not initialized'
     return _CDC_PARALLEL_GROUP
 
 
