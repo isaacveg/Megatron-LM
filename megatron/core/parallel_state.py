@@ -342,7 +342,15 @@ class RankGenerator(object):
     """A class for generating rank groups for different modes of parallelism."""
 
     def __init__(
-        self, tp: int, ep: int, dp: int, pp: int, cp: int, order: str, rank_offset: int = 0
+        self,
+        tp: int,
+        ep: int,
+        dp: int,
+        pp: int,
+        cp: int,
+        order: str = "tp-cp-ep-dp-pp",
+        rank_offset: int = 0,
+        cdc: int = 1,
     ) -> None:
         assert (
             ep == 1 or cp == 1
@@ -354,8 +362,9 @@ class RankGenerator(object):
         self.dp = dp
         self.pp = pp
         self.cp = cp
+        self.cdc = cdc
         self.rank_offset = rank_offset
-        self.world_size = tp * dp * pp * cp * ep
+        self.world_size = tp * dp * pp * cp * ep * cdc
 
         self.name_to_size = {
             "tp": self.tp,
@@ -363,23 +372,43 @@ class RankGenerator(object):
             "dp": self.dp,
             "ep": self.ep,
             "cp": self.cp,
+            "cdc": self.cdc,
         }
-        self.order = order
-        order = order.lower()
+        self.order = order.lower()
+        order_tokens = self.order.split('-')
+        if len(order_tokens) != len(set(order_tokens)):
+            raise RuntimeError(f"Rank order ({self.order}) contains duplicate dimensions.")
 
-        for name in self.name_to_size.keys():
-            if name not in order and self.name_to_size[name] != 1:
+        unknown_tokens = [token for token in order_tokens if token not in self.name_to_size]
+        if unknown_tokens:
+            raise RuntimeError(
+                f"Rank order ({self.order}) contains unsupported dimensions {unknown_tokens}."
+            )
+
+        has_cdc = "cdc" in order_tokens
+        if has_cdc:
+            if order_tokens[-1] != "cdc":
+                raise RuntimeError("CDC rank dimension must be the last dimension in rank order.")
+            order_tokens = order_tokens[:-1]
+
+        for name, size in self.name_to_size.items():
+            if name == "cdc":
+                continue
+            if name not in order_tokens and size != 1:
                 raise RuntimeError(
-                    f"The size of ({name}) is ({self.name_to_size[name]}), but you haven't"
+                    f"The size of ({name}) is ({size}), but you haven't"
                     f"specified the order ({self.order})."
                 )
-            elif name not in order:
-                order = order + '-' + name
+            if name not in order_tokens:
+                order_tokens.append(name)
 
-        self.order = order
+        if has_cdc or cdc > 1:
+            order_tokens.append("cdc")
+
+        self.order = '-'.join(order_tokens)
         self.ordered_size = []
 
-        for token in order.split('-'):
+        for token in self.order.split('-'):
             self.ordered_size.append(self.name_to_size[token])
 
     def get_mask(self, order: str, token: str):
@@ -414,7 +443,6 @@ class RankGenerator(object):
                 for i in range(len(rank_group)):
                     rank_group[i] += self.rank_offset
         return ranks
-
 
 def default_embedding_ranks(pp_ranks, split_rank=None):
     """Return the default ranks that constitute the stages on which the word embeddings live.
@@ -559,7 +587,9 @@ def initialize_model_parallel(
 
         order (str, default=tp-dp-pp):
             The rank initialization order of parallelism. Now we support
-            tp-dp-pp and tp-pp-dp orders.
+            tp-dp-pp and tp-pp-dp orders. When cdc_parallel_size > 1, the CDC
+            dimension is appended as the outermost dimension and must be last
+            if explicitly specified.
 
         encoder_tensor_model_parallel_size (int, default = 0):
             The number of GPUs to split individual tensors across in the encoder. If 0,
@@ -584,7 +614,9 @@ def initialize_model_parallel(
             not created and calls to get Gloo process groups will result in assertion errors.
 
         cdc_parallel_size (int, default = 1):
-            The number of data center islands (outer data parallel size).
+            The number of data center islands (outer data parallel size). Groups
+            without the CDC dimension stay inside each data center; groups that
+            include CDC communicate across data centers for the same local slot.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -645,19 +677,17 @@ def initialize_model_parallel(
     if world_size % total_model_size != 0:
         raise RuntimeError(f"world_size ({world_size}) is not divisible by {total_model_size}")
 
-    data_parallel_size: int = world_size // total_model_size
-    
-    # CHANGE: DiLoCo-like: Split data_parallel_size into inner (Megatron) and outer (DiLoCo)
-    if data_parallel_size % cdc_parallel_size != 0:
-        raise RuntimeError(
-            f"data_parallel_size ({data_parallel_size}) is not divisible by cdc_parallel_size ({cdc_parallel_size})"
-        )
-    inner_data_parallel_size = data_parallel_size // cdc_parallel_size
+    global_data_parallel_size: int = world_size // total_model_size
 
-    
-    
-    encoder_world_size = encoder_model_size * data_parallel_size
-    decoder_world_size = decoder_model_size * data_parallel_size
+    if global_data_parallel_size % cdc_parallel_size != 0:
+        raise RuntimeError(
+            f"global_data_parallel_size ({global_data_parallel_size}) is not divisible by "
+            f"cdc_parallel_size ({cdc_parallel_size})"
+        )
+    inner_data_parallel_size = global_data_parallel_size // cdc_parallel_size
+
+    encoder_world_size = encoder_model_size * global_data_parallel_size
+    decoder_world_size = decoder_model_size * global_data_parallel_size
 
     assert (
         encoder_world_size + decoder_world_size == world_size
@@ -696,11 +726,12 @@ def initialize_model_parallel(
         encoder_rank_generator = RankGenerator(
             tp=encoder_tensor_model_parallel_size,
             ep=1,
-            dp=data_parallel_size,
+            dp=inner_data_parallel_size,
             pp=encoder_pipeline_model_parallel_size,
             cp=context_parallel_size,
             order=order,
             rank_offset=0,
+            cdc=cdc_parallel_size,
         )
     else:
         encoder_rank_generator = None
@@ -708,11 +739,12 @@ def initialize_model_parallel(
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
         ep=1,
-        dp=data_parallel_size,
+        dp=inner_data_parallel_size,
         pp=pipeline_model_parallel_size,
         cp=context_parallel_size,
         order=order,
         rank_offset=encoder_world_size,
+        cdc=cdc_parallel_size,
     )
 
     # Build expert rank generator
@@ -721,33 +753,53 @@ def initialize_model_parallel(
     expert_tensor_model_pipeline_parallel_size = (
         expert_tensor_parallel_size * expert_model_parallel_size * pipeline_model_parallel_size
     )
-    expert_data_parallel_size = decoder_world_size // expert_tensor_model_pipeline_parallel_size
     if decoder_world_size % expert_tensor_model_pipeline_parallel_size != 0:
         raise RuntimeError(
             f"decoder world_size ({decoder_world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({expert_tensor_model_pipeline_parallel_size})"
         )
+    expert_global_data_parallel_size = (
+        decoder_world_size // expert_tensor_model_pipeline_parallel_size
+    )
+    if expert_global_data_parallel_size % cdc_parallel_size != 0:
+        raise RuntimeError(
+            f"expert_global_data_parallel_size ({expert_global_data_parallel_size}) is not "
+            f"divisible by cdc_parallel_size ({cdc_parallel_size})"
+        )
+    inner_expert_data_parallel_size = expert_global_data_parallel_size // cdc_parallel_size
 
     # TODO: support expert specific ordering
     expert_decoder_rank_generator = RankGenerator(
         tp=expert_tensor_parallel_size,
         ep=expert_model_parallel_size,
-        dp=expert_data_parallel_size,
+        dp=inner_expert_data_parallel_size,
         pp=pipeline_model_parallel_size,
         cp=1,
         order=order,
         rank_offset=encoder_world_size,
+        cdc=cdc_parallel_size,
     )
 
+    decoder_order_tokens = decoder_rank_generator.order.split('-')
+    if decoder_order_tokens[-1] == "cdc":
+        decoder_order_tokens = decoder_order_tokens[:-1]
     assert (
-        order.endswith("pp")
+        decoder_order_tokens[-1] == "pp"
         or pipeline_model_parallel_size == 1
-        or expert_data_parallel_size == data_parallel_size
-    ), "When not using pp-last rank ordering, the data parallel size of the attention and moe layers must be the same"
+        or expert_global_data_parallel_size == global_data_parallel_size
+    ), "When not using pp-last rank ordering, the global data parallel size of the attention and moe layers must be the same"
 
     assert decoder_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks(
         "pp"
     ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
     but got {decoder_rank_generator.get_ranks('pp')} and {expert_decoder_rank_generator.get_ranks('pp')}"
+
+    # CDC parallel debug info
+    if cdc_parallel_size > 1 and rank == 0:
+        print(f"[CDC RankGenerator] dense pp groups: {decoder_rank_generator.get_ranks('pp')[:8]}", flush=True)
+        print(f"[CDC RankGenerator] expert pp groups: {expert_decoder_rank_generator.get_ranks('pp')[:8]}", flush=True)
+        print(f"[CDC RankGenerator] dense dp groups: {decoder_rank_generator.get_ranks('dp')[:8]}", flush=True)
+        print(f"[CDC RankGenerator] sampler groups: {decoder_rank_generator.get_ranks('dp-cdc')[:8]}", flush=True)
+        print(f"[CDC RankGenerator] cdc groups: {decoder_rank_generator.get_ranks('cdc')[:8]}", flush=True)
 
     def generator_wrapper(group_type, is_expert=False, **kwargs):
         """The `RankGenerator` class produces a hyper-rectangle for a given set of
@@ -824,84 +876,49 @@ def initialize_model_parallel(
     global _MPU_DATA_SAMPLER_RANK
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
-    # for ranks in generator_wrapper('dp'):
-    #     group = create_group(
-    #         ranks,
-    #         timeout=timeout,
-    #         pg_options=get_nccl_options('dp', nccl_comm_cfgs),
-    #         group_desc='DATA_PARALLEL_GROUP',
-    #     )
-    #     if create_gloo_process_groups:
-    #         group_gloo = create_group(
-    #             ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
-    #         )
-    #     else:
-    #         group_gloo = None
-    #     if rank in ranks:
-    #         _DATA_PARALLEL_GROUP = group
-    #         _DATA_PARALLEL_GROUP_GLOO = group_gloo
-    #         _DATA_PARALLEL_GLOBAL_RANKS = ranks
-    # CHANGE: DiLoCo / CDC: Split global DP ranks into Inner DP (Megatron) and Outer DP (Cross-DC)
-    all_dp_ranks_lists = list(generator_wrapper('dp'))
-    rank_to_cdc_index = {}
-
-    def split_ranks_by_cdc(ranks):
-        """Split a rank list that spans the DP dimension into per-island subgroups."""
-        if cdc_parallel_size == 1:
-            return [ranks]
-
-        split_ranks = [[] for _ in range(cdc_parallel_size)]
-        for global_rank in ranks:
-            split_ranks[rank_to_cdc_index[global_rank]].append(global_rank)
-        return [sub_ranks for sub_ranks in split_ranks if sub_ranks]
-
-    for global_dp_ranks in all_dp_ranks_lists:
-        assert len(global_dp_ranks) == data_parallel_size
+    data_sampler_group_type = 'dp-cdc' if cdc_parallel_size > 1 else 'dp'
+    for global_dp_ranks in generator_wrapper(data_sampler_group_type):
+        assert len(global_dp_ranks) == global_data_parallel_size
         if rank in global_dp_ranks:
             _DATA_SAMPLER_GLOBAL_RANKS = global_dp_ranks
             _MPU_DATA_SAMPLER_WORLD_SIZE = len(global_dp_ranks)
             _MPU_DATA_SAMPLER_RANK = global_dp_ranks.index(rank)
-        
-        # 1. Create Inner DP Groups (Megatron DP)
-        for i in range(cdc_parallel_size):
-            start_idx = i * inner_data_parallel_size
-            end_idx = (i + 1) * inner_data_parallel_size
-            inner_dp_ranks = global_dp_ranks[start_idx:end_idx]
-            for global_rank in inner_dp_ranks:
-                rank_to_cdc_index[global_rank] = i
-            
-            group = create_group(
-                inner_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options('dp', nccl_comm_cfgs),
-                group_desc='DATA_PARALLEL_GROUP',
-            )
-            if create_gloo_process_groups:
-                group_gloo = create_group(
-                    inner_dp_ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
-                )
-            else:
-                group_gloo = None
-            if rank in inner_dp_ranks:
-                _DATA_PARALLEL_GROUP = group
-                _DATA_PARALLEL_GROUP_GLOO = group_gloo
-                _DATA_PARALLEL_GLOBAL_RANKS = inner_dp_ranks
 
-        # 2. Create Outer DP Groups (CDC cross-DC group)
-        for j in range(inner_data_parallel_size):
-            outer_dp_ranks = [global_dp_ranks[i * inner_data_parallel_size + j] for i in range(cdc_parallel_size)]
-            
-            group = create_group(
-                outer_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options('dp', nccl_comm_cfgs),
-                group_desc='CDC_PARALLEL_GROUP',
+    for ranks in generator_wrapper('dp'):
+        assert len(ranks) == inner_data_parallel_size
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('dp', nccl_comm_cfgs),
+            group_desc='DATA_PARALLEL_GROUP',
+        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
             )
-            if rank in outer_dp_ranks:
-                _CDC_PARALLEL_GROUP = group
-                _CDC_PARALLEL_GLOBAL_RANKS = outer_dp_ranks
-                _MPU_CDC_PARALLEL_WORLD_SIZE = len(outer_dp_ranks)
-                _MPU_CDC_PARALLEL_RANK = outer_dp_ranks.index(rank)
+        else:
+            group_gloo = None
+        if rank in ranks:
+            _DATA_PARALLEL_GROUP = group
+            _DATA_PARALLEL_GROUP_GLOO = group_gloo
+            _DATA_PARALLEL_GLOBAL_RANKS = ranks
+
+    cdc_rank_groups = (
+        generator_wrapper('cdc') if cdc_parallel_size > 1 else ([r] for r in range(world_size))
+    )
+    for cdc_ranks in cdc_rank_groups:
+        assert len(cdc_ranks) == cdc_parallel_size
+        group = create_group(
+            cdc_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('cdc', nccl_comm_cfgs),
+            group_desc='CDC_PARALLEL_GROUP',
+        )
+        if rank in cdc_ranks:
+            _CDC_PARALLEL_GROUP = group
+            _CDC_PARALLEL_GLOBAL_RANKS = cdc_ranks
+            _MPU_CDC_PARALLEL_WORLD_SIZE = len(cdc_ranks)
+            _MPU_CDC_PARALLEL_RANK = cdc_ranks.index(rank)
 
     assert (
         inner_data_parallel_size * context_parallel_size
@@ -913,82 +930,82 @@ def initialize_model_parallel(
     ) // num_distributed_optimizer_instances
 
     for ranks_with_cp in generator_wrapper('dp-cp'):
-        for inner_ranks_with_cp in split_ranks_by_cdc(ranks_with_cp):
-            group_with_cp = create_group(
-                inner_ranks_with_cp,
+        assert len(ranks_with_cp) == inner_data_parallel_size * context_parallel_size
+        group_with_cp = create_group(
+            ranks_with_cp,
+            timeout=timeout,
+            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
+            group_desc='DATA_PARALLEL_GROUP_WITH_CP',
+        )
+        if create_gloo_process_groups:
+            group_with_cp_gloo = create_group(
+                ranks_with_cp,
                 timeout=timeout,
-                pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
-                group_desc='DATA_PARALLEL_GROUP_WITH_CP',
+                backend="gloo",
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
             )
-            if create_gloo_process_groups:
-                group_with_cp_gloo = create_group(
-                    inner_ranks_with_cp,
+        else:
+            group_with_cp_gloo = None
+        if rank in ranks_with_cp:
+            _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+            _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
+            _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
+
+        if num_distributed_optimizer_instances > 1:
+            # Create groups for Partial DistOpt, one for intra-partial DP domain
+            # Another for inter-partial DP domain
+            for i in range(num_distributed_optimizer_instances):
+                intra_partial_data_parallel_ranks_with_cp = ranks_with_cp[
+                    (i * intra_partial_data_parallel_size) : (
+                        (i + 1) * intra_partial_data_parallel_size
+                    )
+                ]
+
+                intra_partial_data_parallel_group_with_cp = create_group(
+                    intra_partial_data_parallel_ranks_with_cp,
                     timeout=timeout,
-                    backend="gloo",
-                    group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                    pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
+                    group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
                 )
-            else:
-                group_with_cp_gloo = None
-            if rank in inner_ranks_with_cp:
-                _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-                _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
-                _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = inner_ranks_with_cp
-
-            if num_distributed_optimizer_instances > 1:
-                # Create groups for Partial DistOpt, one for intra-partial DP domain
-                # Another for inter-partial DP domain
-                for i in range(num_distributed_optimizer_instances):
-                    intra_partial_data_parallel_ranks_with_cp = inner_ranks_with_cp[
-                        (i * intra_partial_data_parallel_size) : (
-                            (i + 1) * intra_partial_data_parallel_size
-                        )
-                    ]
-
-                    intra_partial_data_parallel_group_with_cp = create_group(
+                if create_gloo_process_groups:
+                    intra_partial_data_parallel_group_with_cp_gloo = create_group(
                         intra_partial_data_parallel_ranks_with_cp,
                         timeout=timeout,
-                        pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
-                        group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
+                        backend="gloo",
+                        group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
                     )
-                    if create_gloo_process_groups:
-                        intra_partial_data_parallel_group_with_cp_gloo = create_group(
-                            intra_partial_data_parallel_ranks_with_cp,
-                            timeout=timeout,
-                            backend="gloo",
-                            group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
-                        )
-                    else:
-                        intra_partial_data_parallel_group_with_cp_gloo = None
+                else:
+                    intra_partial_data_parallel_group_with_cp_gloo = None
 
-                    if rank in intra_partial_data_parallel_ranks_with_cp:
-                        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
-                            intra_partial_data_parallel_group_with_cp
-                        )
-                        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
-                            intra_partial_data_parallel_group_with_cp_gloo
-                        )
-
-                for i in range(intra_partial_data_parallel_size):
-                    inter_partial_data_parallel_ranks_with_cp = inner_ranks_with_cp[
-                        i::intra_partial_data_parallel_size
-                    ]
-
-                    inter_partial_data_parallel_group_with_cp = create_group(
-                        inter_partial_data_parallel_ranks_with_cp,
-                        timeout=timeout,
-                        pg_options=get_nccl_options('inter_dp_cp', nccl_comm_cfgs),
-                        group_desc='INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
+                if rank in intra_partial_data_parallel_ranks_with_cp:
+                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
+                        intra_partial_data_parallel_group_with_cp
+                    )
+                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
+                        intra_partial_data_parallel_group_with_cp_gloo
                     )
 
-                    if rank in inter_partial_data_parallel_ranks_with_cp:
-                        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
-                            inter_partial_data_parallel_group_with_cp
-                        )
-            else:
-                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
-                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
-                    _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+            for i in range(intra_partial_data_parallel_size):
+                inter_partial_data_parallel_ranks_with_cp = ranks_with_cp[
+                    i::intra_partial_data_parallel_size
+                ]
+
+                inter_partial_data_parallel_group_with_cp = create_group(
+                    inter_partial_data_parallel_ranks_with_cp,
+                    timeout=timeout,
+                    pg_options=get_nccl_options('inter_dp_cp', nccl_comm_cfgs),
+                    group_desc='INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
                 )
+
+                if rank in inter_partial_data_parallel_ranks_with_cp:
+                    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
+                        inter_partial_data_parallel_group_with_cp
+                    )
+        else:
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
+                _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+            )
 
     # Apply SHARP to DP process groups
     if use_sharp:
@@ -1189,25 +1206,23 @@ def initialize_model_parallel(
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
     for ranks in generator_wrapper('tp-dp-cp'):
-        for inner_ranks in split_ranks_by_cdc(ranks):
-            group = create_group(
-                inner_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs),
-                group_desc='TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP',
-            )
-            if rank in inner_ranks:
-                _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs),
+            group_desc='TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP',
+        )
+        if rank in ranks:
+            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
     for ranks in generator_wrapper('tp-dp'):
-        for inner_ranks in split_ranks_by_cdc(ranks):
-            group = create_group(
-                inner_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs),
-                group_desc='TENSOR_AND_DATA_PARALLEL_GROUP',
-            )
-            if rank in inner_ranks:
-                _TENSOR_AND_DATA_PARALLEL_GROUP = group
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs),
+            group_desc='TENSOR_AND_DATA_PARALLEL_GROUP',
+        )
+        if rank in ranks:
+            _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     assert (
@@ -1288,22 +1303,22 @@ def initialize_model_parallel(
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, 'Expert data group-gloo is already initialized'
 
     for ranks in generator_wrapper('dp', is_expert=True):
-        for inner_ranks in split_ranks_by_cdc(ranks):
-            group = create_group(
-                inner_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options('ep_dp', nccl_comm_cfgs),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP',
+        assert len(ranks) == inner_expert_data_parallel_size
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('ep_dp', nccl_comm_cfgs),
+            group_desc='EXPERT_DATA_PARALLEL_GROUP',
+        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
             )
-            if create_gloo_process_groups:
-                group_gloo = create_group(
-                    inner_ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
-                )
-            else:
-                group_gloo = None
-            if rank in inner_ranks:
-                _EXPERT_DATA_PARALLEL_GROUP = group
-                _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
+        else:
+            group_gloo = None
+        if rank in ranks:
+            _EXPERT_DATA_PARALLEL_GROUP = group
+            _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
     ### End of expert related parallel groups initialization
 
     # Initialize global memory buffer

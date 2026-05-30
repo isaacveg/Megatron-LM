@@ -83,6 +83,11 @@ class CDCOptimizer(MegatronOptimizer):
         self.verbose = args.cdc_verbose
         self.mixed_precision = args.bf16 or args.fp16
         self._named_model_param_list = self._iter_named_trainable_params_unique(self.model_chunks)
+        (
+            self._layer_prefix_to_global_idx,
+            self._local_moe_module_to_global_key,
+            self._global_moe_module_index,
+        ) = self._build_global_identity_indices()
         self._expert_named_model_params = self._collect_routed_expert_named_params(
             self._named_model_param_list
         )
@@ -141,18 +146,11 @@ class CDCOptimizer(MegatronOptimizer):
         self._expert_layer_to_tracker_indices: Dict[int, List[int]] = {}
         self._expert_layer_order: List[int] = []
 
-        if self.enable_moe_expert_refresh and int(args.expert_model_parallel_size) != 1:
-            raise NotImplementedError(
-                "dense-expert-hybrid currently supports expert_model_parallel_size=1 only."
-            )
-
-        self._moe_module_index = (
-            self._build_moe_module_index() if self.track_expert_token_load else {}
-        )
-        if self.verbose and self._moe_module_index:
-            preview_keys = sorted(self._moe_module_index.keys())[:8]
+        if self.verbose and self.track_expert_token_load and self._global_moe_module_index:
+            preview_keys = sorted(self._global_moe_module_index.keys())[:8]
             print_rank_0(
-                f"[CDC][MoEIndex] modules={len(self._moe_module_index)} preview={preview_keys}"
+                f"[CDC][MoEIndex] modules={len(self._global_moe_module_index)} "
+                f"preview={preview_keys}"
             )
 
         if self.verbose:
@@ -317,7 +315,7 @@ class CDCOptimizer(MegatronOptimizer):
         if self.algorithm == 'diloco' and getattr(self, "original_snapshot", None) is not None:
             state["diloco"] = self._serialize_diloco_state()
         elif self.algorithm in ['streaming', 'dc'] and getattr(self, "shard_tracker", None) is not None:
-            state["streaming_layout_version"] = 2
+            state["streaming_layout_version"] = 3
             state["shards"] = self._serialize_tracker_dict(self.shard_tracker)
             if getattr(self, "router_tracker", None):
                 state["router_shards"] = self._serialize_tracker_dict(self.router_tracker)
@@ -354,6 +352,7 @@ class CDCOptimizer(MegatronOptimizer):
                 "moe_module_key": tracker.get("moe_module_key"),
                 "moe_layer_idx": tracker.get("moe_layer_idx"),
                 "local_expert_idx": tracker.get("local_expert_idx"),
+                "global_expert_idx": tracker.get("global_expert_idx"),
             }
 
             if tracker.get("outer_optimizer") is not None:
@@ -421,6 +420,16 @@ class CDCOptimizer(MegatronOptimizer):
                     "This CDC checkpoint uses the legacy hybrid layout with router parameters "
                     "embedded in dense shards. The current code keeps routers in a dedicated "
                     "tracker, so resume from this CDC optimizer state is not supported."
+                )
+            args = get_args()
+            if layout_version < 3 and (
+                int(getattr(args, "pipeline_model_parallel_size", 1)) > 1
+                or int(getattr(args, "expert_model_parallel_size", 1)) > 1
+            ):
+                raise ValueError(
+                    "This CDC checkpoint uses a layout without global layer/expert identities. "
+                    "Resume under PP>1 or EP>1 is not supported because local layer/expert "
+                    "indices are ambiguous."
                 )
             self._load_tracker_dict(self.shard_tracker, cdc_state.get("shards"))
             if getattr(self, "router_tracker", None) is not None:
@@ -498,6 +507,9 @@ class CDCOptimizer(MegatronOptimizer):
             )
             tracker["local_expert_idx"] = shard_state.get(
                 "local_expert_idx", tracker.get("local_expert_idx")
+            )
+            tracker["global_expert_idx"] = shard_state.get(
+                "global_expert_idx", tracker.get("global_expert_idx")
             )
 
             outer_state = shard_state.get("outer_optimizer")
@@ -585,11 +597,130 @@ class CDCOptimizer(MegatronOptimizer):
         return '.router.' in param_name
 
     @staticmethod
-    def _routed_expert_group_key(param_name: str) -> Optional[str]:
-        match = re.search(r"(.*?\.experts\.local_experts\.\d+)\.", param_name)
+    def _layer_prefix_from_name(name: str) -> Optional[str]:
+        normalized = CDCOptimizer._normalize_module_name(name)
+        match = re.match(r"(.*?\.layers\.\d+)(?:\.|$)", normalized)
         if match is None:
             return None
         return match.group(1)
+
+    @staticmethod
+    def _local_expert_prefix_from_name(param_name: str) -> Optional[Tuple[str, int]]:
+        normalized = CDCOptimizer._normalize_module_name(param_name)
+        match = re.search(r"(.*)\.experts\.local_experts\.(\d+)(?:\.|$)", normalized)
+        if match is None:
+            return None
+        return match.group(1), int(match.group(2))
+
+    def _build_global_identity_indices(
+        self,
+    ) -> Tuple[Dict[str, int], Dict[str, str], Dict[str, torch.nn.Module]]:
+        layer_to_global_idx: Dict[str, int] = {}
+        local_moe_to_global: Dict[str, str] = {}
+        global_moe_index: Dict[str, torch.nn.Module] = {}
+
+        for name, module in self._iter_named_modules_unique(self.model_chunks):
+            normalized_name = self._normalize_module_name(name)
+            layer_number = getattr(module, "layer_number", None)
+            if layer_number is not None:
+                prefix = self._layer_prefix_from_name(normalized_name)
+                if prefix is not None:
+                    global_idx = int(layer_number) - 1
+                    previous = layer_to_global_idx.get(prefix)
+                    if previous is not None and previous != global_idx:
+                        raise ValueError(
+                            f"Layer prefix {prefix!r} maps to both global layer "
+                            f"{previous} and {global_idx}."
+                        )
+                    layer_to_global_idx[prefix] = global_idx
+
+            if not normalized_name or not (
+                hasattr(module, "token_dispatcher") and hasattr(module, "experts")
+            ):
+                continue
+
+            global_key = self._globalize_moe_module_name(normalized_name, module)
+            previous_module = global_moe_index.get(global_key)
+            if previous_module is not None and previous_module is not module:
+                raise ValueError(f"Duplicate global MoE module key detected: {global_key!r}")
+            local_moe_to_global[normalized_name] = global_key
+            global_moe_index[global_key] = module
+
+        return layer_to_global_idx, local_moe_to_global, global_moe_index
+
+    def _global_layer_index_for_param(self, param_name: str) -> Optional[int]:
+        prefix = self._layer_prefix_from_name(param_name)
+        if prefix is None:
+            return None
+        if prefix in self._layer_prefix_to_global_idx:
+            return self._layer_prefix_to_global_idx[prefix]
+
+        if int(getattr(get_args(), "pipeline_model_parallel_size", 1)) > 1:
+            raise ValueError(
+                f"Cannot map parameter {param_name!r} to a global layer id under PP. "
+                "Expected the owning layer module to expose layer_number."
+            )
+
+        local_idx = self._parse_layer_index(param_name)
+        if local_idx is None:
+            return None
+        return local_idx
+
+    def _globalize_moe_module_name(self, local_name: str, module: torch.nn.Module) -> str:
+        normalized_name = self._normalize_module_name(local_name)
+        layer_number = getattr(module, "layer_number", None)
+        if layer_number is None:
+            if int(getattr(get_args(), "pipeline_model_parallel_size", 1)) > 1:
+                raise ValueError(
+                    f"MoE module {normalized_name!r} is missing layer_number; "
+                    "cannot build a globally unique CDC expert key under PP."
+                )
+            return normalized_name
+
+        match = re.match(r"(.*?\.layers\.)(\d+)(\..*)?$", normalized_name)
+        if match is None:
+            raise ValueError(
+                f"MoE module {normalized_name!r} does not contain a '.layers.<idx>' segment."
+            )
+        prefix, _, suffix = match.groups()
+        return f"{prefix}{int(layer_number) - 1}{suffix or ''}"
+
+    def _routed_expert_param_metadata(self, param_name: str) -> Optional[Dict[str, Any]]:
+        expert_prefix = self._local_expert_prefix_from_name(param_name)
+        if expert_prefix is None:
+            return None
+
+        local_module_key, local_expert_idx = expert_prefix
+        local_module_key = self._normalize_module_name(local_module_key)
+        global_module_key = self._local_moe_module_to_global_key.get(local_module_key)
+        if global_module_key is None:
+            raise ValueError(
+                f"Could not map routed expert parameter {param_name!r} to a MoE module."
+            )
+
+        module = self._global_moe_module_index[global_module_key]
+        local_expert_indices = getattr(module, "local_expert_indices", None)
+        if local_expert_indices is None:
+            raise ValueError(
+                f"MoE module {global_module_key!r} is missing local_expert_indices; "
+                "cannot build a globally unique CDC expert key under EP."
+            )
+        if local_expert_idx < 0 or local_expert_idx >= len(local_expert_indices):
+            raise ValueError(
+                f"Local expert index {local_expert_idx} from {param_name!r} is outside "
+                f"module {global_module_key!r} local expert layout {local_expert_indices}."
+            )
+
+        global_expert_idx = int(local_expert_indices[local_expert_idx])
+        layer_idx = self._parse_layer_index(global_module_key)
+        group_key = f"{global_module_key}.experts.global_experts.{global_expert_idx}"
+        return {
+            "group_key": group_key,
+            "moe_module_key": global_module_key,
+            "moe_layer_idx": layer_idx,
+            "local_expert_idx": local_expert_idx,
+            "global_expert_idx": global_expert_idx,
+        }
 
     def _collect_routed_expert_named_params(
         self, named_params: List[Tuple[str, torch.nn.Parameter]]
@@ -616,23 +747,15 @@ class CDCOptimizer(MegatronOptimizer):
             normalized = normalized[len("module.") :]
         return normalized
 
-    def _extract_expert_group_metadata(self, group_name: str) -> Tuple[str, Optional[int], Optional[int]]:
-        normalized = self._normalize_module_name(group_name)
-        module_match = re.match(r"(.*)\.experts\.local_experts\.(\d+)$", normalized)
-        if module_match is None:
-            return normalized, None, None
-
-        module_key = module_match.group(1)
-        expert_idx = int(module_match.group(2))
-        layer_idx = self._parse_layer_index(module_key)
-        return module_key, layer_idx, expert_idx
-
     def _expert_group_sort_key(self, group_name: str) -> Tuple[int, int, str]:
-        _, layer_idx, expert_idx = self._extract_expert_group_metadata(group_name)
+        normalized = self._normalize_module_name(group_name)
+        match = re.match(r"(.*)\.experts\.(?:local_experts|global_experts)\.(\d+)$", normalized)
+        layer_idx = self._parse_layer_index(match.group(1)) if match is not None else None
+        expert_idx = int(match.group(2)) if match is not None else None
         return (
             layer_idx if layer_idx is not None else 10**9,
             expert_idx if expert_idx is not None else 10**9,
-            self._normalize_module_name(group_name),
+            normalized,
         )
 
     @staticmethod
@@ -649,21 +772,6 @@ class CDCOptimizer(MegatronOptimizer):
                 seen_ids.add(mid)
                 results.append((name, module))
         return results
-
-    def _build_moe_module_index(self) -> Dict[str, torch.nn.Module]:
-        module_index: Dict[str, torch.nn.Module] = {}
-        for name, module in self._iter_named_modules_unique(self.model_chunks):
-            normalized_name = self._normalize_module_name(name)
-            if not normalized_name:
-                continue
-            if hasattr(module, "token_dispatcher") and hasattr(module, "experts"):
-                module_index[normalized_name] = module
-        return module_index
-
-    def _lookup_moe_module(self, module_key: str) -> Optional[torch.nn.Module]:
-        if not module_key:
-            return None
-        return self._moe_module_index.get(module_key)
 
     @staticmethod
     def _tokens_per_expert_to_float_list(value: Any) -> List[float]:
@@ -730,25 +838,35 @@ class CDCOptimizer(MegatronOptimizer):
 
     def _group_routed_expert_named_params(
         self,
-    ) -> Dict[str, List[Tuple[str, torch.nn.Parameter]]]:
-        grouped: Dict[str, List[Tuple[str, torch.nn.Parameter]]] = {}
+    ) -> Dict[str, Dict[str, Any]]:
+        grouped: Dict[str, Dict[str, Any]] = {}
         for name, param in self._expert_named_model_params:
-            group_key = self._routed_expert_group_key(name)
-            if group_key is None:
+            metadata = self._routed_expert_param_metadata(name)
+            if metadata is None:
                 continue
-            grouped.setdefault(group_key, []).append((name, param))
+            group_key = metadata["group_key"]
+            group = grouped.get(group_key)
+            if group is None:
+                group = grouped[group_key] = {
+                    "named_params": [],
+                    "moe_module_key": metadata["moe_module_key"],
+                    "moe_layer_idx": metadata["moe_layer_idx"],
+                    "local_expert_idx": metadata["local_expert_idx"],
+                    "global_expert_idx": metadata["global_expert_idx"],
+                }
+            group["named_params"].append((name, param))
         return grouped
 
     def _build_tracker(
         self,
         param_refs: List[torch.nn.Parameter],
         *,
-        tp_group,
-        pp_group,
+        score_reduce_groups: Optional[List[Any]] = None,
         display_name: str,
         moe_module_key: Optional[str] = None,
         moe_layer_idx: Optional[int] = None,
         local_expert_idx: Optional[int] = None,
+        global_expert_idx: Optional[int] = None,
         comm_dtype: Optional[torch.dtype] = None,
         apply_alpha: Optional[float] = None,
         outer_lr: Optional[float] = None,
@@ -774,6 +892,8 @@ class CDCOptimizer(MegatronOptimizer):
             "moe_module_key": moe_module_key,
             "moe_layer_idx": moe_layer_idx,
             "local_expert_idx": local_expert_idx,
+            "global_expert_idx": global_expert_idx,
+            "score_reduce_groups": list(score_reduce_groups or []),
         }
 
         for p in param_refs:
@@ -793,8 +913,9 @@ class CDCOptimizer(MegatronOptimizer):
             tracker["outer_optimizer"] = None
 
         local_numel = sum(p.numel() for p in param_refs)
-        global_numel = self._all_reduce_scalar_sum(local_numel, group=tp_group)
-        global_numel = self._all_reduce_scalar_sum(global_numel, group=pp_group)
+        global_numel = self._all_reduce_scalar_sum_across_groups(
+            local_numel, tracker["score_reduce_groups"]
+        )
         tracker["global_num_params"] = int(global_numel)
 
         if len(tracker["params"]) > 0:
@@ -934,7 +1055,7 @@ class CDCOptimizer(MegatronOptimizer):
             # Fallback: infer from local parameter names.
             local_layer_ids = set()
             for name, _ in self._iter_named_trainable_params_unique(self.model_chunks):
-                layer_idx = self._parse_layer_index(name)
+                layer_idx = self._global_layer_index_for_param(name)
                 if layer_idx is not None:
                     local_layer_ids.add(layer_idx)
             num_layers = (max(local_layer_ids) + 1) if local_layer_ids else 0
@@ -980,13 +1101,14 @@ class CDCOptimizer(MegatronOptimizer):
 
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
+        dense_score_reduce_groups = [tp_group, pp_group]
+        expert_score_reduce_groups = [mpu.get_expert_tensor_parallel_group()]
 
         for shard_idx in range(self.num_shards):
             param_refs = shard_to_param_refs.get(shard_idx, [])
             tracker = self._build_tracker(
                 param_refs,
-                tp_group=tp_group,
-                pp_group=pp_group,
+                score_reduce_groups=dense_score_reduce_groups,
                 display_name=f"dense-shard-{shard_idx}",
                 apply_alpha=self.dense_alpha,
                 outer_lr=self.dense_outer_lr,
@@ -1004,8 +1126,7 @@ class CDCOptimizer(MegatronOptimizer):
             router_param_refs = [param for _, param in self._router_named_model_params]
             router_tracker = self._build_tracker(
                 router_param_refs,
-                tp_group=tp_group,
-                pp_group=pp_group,
+                score_reduce_groups=dense_score_reduce_groups,
                 display_name="moe-router",
                 comm_dtype=torch.float32,
                 apply_alpha=self.router_alpha,
@@ -1030,18 +1151,20 @@ class CDCOptimizer(MegatronOptimizer):
             for expert_idx, expert_group_name in enumerate(
                 sorted(expert_groups.keys(), key=self._expert_group_sort_key)
             ):
-                expert_param_refs = [param for _, param in expert_groups[expert_group_name]]
-                moe_module_key, moe_layer_idx, local_expert_idx = self._extract_expert_group_metadata(
-                    expert_group_name
-                )
+                expert_group = expert_groups[expert_group_name]
+                expert_param_refs = [param for _, param in expert_group["named_params"]]
+                moe_module_key = expert_group["moe_module_key"]
+                moe_layer_idx = expert_group["moe_layer_idx"]
+                local_expert_idx = expert_group["local_expert_idx"]
+                global_expert_idx = expert_group["global_expert_idx"]
                 tracker = self._build_tracker(
                     expert_param_refs,
-                    tp_group=tp_group,
-                    pp_group=pp_group,
+                    score_reduce_groups=expert_score_reduce_groups,
                     display_name=expert_group_name,
                     moe_module_key=moe_module_key,
                     moe_layer_idx=moe_layer_idx,
                     local_expert_idx=local_expert_idx,
+                    global_expert_idx=global_expert_idx,
                     apply_alpha=self.expert_alpha,
                     outer_lr=self.expert_outer_lr,
                 )
@@ -1057,7 +1180,8 @@ class CDCOptimizer(MegatronOptimizer):
                         print_rank_0(
                             f"[CDC][MoETracker] group={expert_group_name} "
                             f"module_key={moe_module_key} layer_idx={moe_layer_idx} "
-                            f"local_expert_idx={local_expert_idx}"
+                            f"local_expert_idx={local_expert_idx} "
+                            f"global_expert_idx={global_expert_idx}"
                         )
             self._rebuild_expert_layer_index()
             if self.expert_layerwise_selection and not self._expert_layer_order:
@@ -1133,7 +1257,7 @@ class CDCOptimizer(MegatronOptimizer):
             return 0
 
         # 2) Decoder layers
-        layer_idx = self._parse_layer_index(name)
+        layer_idx = self._global_layer_index_for_param(name)
         if layer_idx is not None and num_layers > 0 and decoder_shards > 0:
             decoder_shard_idx = self._layer_to_decoder_shard(layer_idx, num_layers, decoder_shards)
             return embedding_shards + decoder_shard_idx
@@ -1180,7 +1304,20 @@ class CDCOptimizer(MegatronOptimizer):
                 results.append((name, p))
         return results
 
+    @staticmethod
+    def _canonical_group(group):
+        if isinstance(group, list):
+            return group[0] if group else None
+        return group
+
+    def _all_reduce_scalar_sum_across_groups(self, value: float, groups: List[Any]) -> float:
+        reduced = float(value)
+        for group in groups:
+            reduced = self._all_reduce_scalar_sum(reduced, group=group)
+        return float(reduced)
+
     def _all_reduce_scalar_sum(self, value: float, group) -> float:
+        group = self._canonical_group(group)
         if group is None:
             return float(value)
         if dist.get_world_size(group=group) <= 1:
@@ -1194,6 +1331,7 @@ class CDCOptimizer(MegatronOptimizer):
     def _all_reduce_vector_sum(self, values: List[float], group) -> List[float]:
         if not values:
             return []
+        group = self._canonical_group(group)
         if group is None:
             return [float(v) for v in values]
         if dist.get_world_size(group=group) <= 1:
@@ -1203,6 +1341,28 @@ class CDCOptimizer(MegatronOptimizer):
         tensor = torch.tensor(values, device=device, dtype=torch.float32)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
         return [float(v) for v in tensor.cpu().tolist()]
+
+    def _reduce_expert_token_values(
+        self, ordered_indices: List[int], local_values: List[float]
+    ) -> List[float]:
+        if not ordered_indices:
+            return []
+
+        reduced_values = [float(v) for v in local_values]
+        score_reduce_groups = self.expert_shard_tracker[ordered_indices[0]].get(
+            "score_reduce_groups", []
+        )
+
+        # Expert TP ranks process the same global expert identity. Average across ExpertTP
+        # to keep selection/logging consistent without multiplying the routed token count.
+        for group in score_reduce_groups:
+            group = self._canonical_group(group)
+            world_size = 1 if group is None else dist.get_world_size(group=group)
+            reduced_values = self._all_reduce_vector_sum(reduced_values, group=group)
+            if world_size > 1:
+                reduced_values = [value / world_size for value in reduced_values]
+
+        return self._all_reduce_vector_sum(reduced_values, group=self.cdc_group)
 
     def _register_token_load_expert_hooks(self) -> None:
         if not getattr(self, "expert_shard_tracker", None):
@@ -1220,7 +1380,7 @@ class CDCOptimizer(MegatronOptimizer):
         hooked_count = 0
 
         for module_key in sorted(module_to_tracker_indices.keys()):
-            module = self._lookup_moe_module(module_key)
+            module = self._global_moe_module_index.get(module_key)
             experts_module = getattr(module, "experts", None) if module is not None else None
             if experts_module is None or not hasattr(experts_module, "register_forward_pre_hook"):
                 raise ValueError(
@@ -1809,8 +1969,8 @@ class CDCOptimizer(MegatronOptimizer):
             return update_scores
 
         ordered_indices = sorted(candidate_indices)
-        reduced_token_values = self._all_reduce_vector_sum(
-            [token_scores_local[idx] for idx in ordered_indices], group=self.cdc_group
+        reduced_token_values = self._reduce_expert_token_values(
+            ordered_indices, [token_scores_local[idx] for idx in ordered_indices]
         )
         token_scores = {
             idx: value for idx, value in zip(ordered_indices, reduced_token_values)
@@ -1874,9 +2034,7 @@ class CDCOptimizer(MegatronOptimizer):
                 )
                 for idx in ordered_indices
             ]
-            reduced_token_values = self._all_reduce_vector_sum(
-                local_token_values, group=self.cdc_group
-            )
+            reduced_token_values = self._reduce_expert_token_values(ordered_indices, local_token_values)
             global_token_accum = {
                 idx: float(value)
                 for idx, value in zip(ordered_indices, reduced_token_values)
@@ -1902,6 +2060,7 @@ class CDCOptimizer(MegatronOptimizer):
                 "unsent": self._expert_tracker_is_unsent(tracker),
                 "sent_at_step": sent_step,
                 "sent_at_expert_event": sent_event,
+                "global_expert_idx": tracker.get("global_expert_idx"),
                 "next_receive_step": next_receive_step,
                 "age_slots": age_slots,
                 "slot_stale": slot_stale,
@@ -1980,6 +2139,7 @@ class CDCOptimizer(MegatronOptimizer):
                 f"reason={select_reason} "
                 f"sent_step={row['sent_at_step']} "
                 f"sent_event={row['sent_at_expert_event']} "
+                f"global_expert={row['global_expert_idx']} "
                 f"next_recv={row['next_receive_step']} "
                 f"age_slots={row['age_slots']} "
                 f"slot_stale={int(row['slot_stale'])} "
@@ -2204,9 +2364,6 @@ class CDCOptimizer(MegatronOptimizer):
             batched_sync_grads, communication_dtype=batch_comm_dtype
         )
 
-        tp_group = mpu.get_tensor_model_parallel_group()
-        pp_group = mpu.get_pipeline_model_parallel_group()
-
         for entry_tracker_idx, tracker, global_params, sync_grads in tracker_entries:
             tracker_label = tracker.get("display_name", str(entry_tracker_idx))
 
@@ -2214,15 +2371,9 @@ class CDCOptimizer(MegatronOptimizer):
             for grad_tensor in sync_grads:
                 total_norm_sq += float(grad_tensor.float().pow(2).sum().item())
 
-            if tp_group is not None and dist.get_world_size(group=tp_group) > 1:
-                norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
-                dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=tp_group)
-                total_norm_sq = norm_tensor.item()
-
-            if pp_group is not None and dist.get_world_size(group=pp_group) > 1:
-                norm_tensor = torch.tensor(float(total_norm_sq), device=torch.device('cuda'))
-                dist.all_reduce(norm_tensor, op=dist.ReduceOp.SUM, group=pp_group)
-                total_norm_sq = norm_tensor.item()
+            total_norm_sq = self._all_reduce_scalar_sum_across_groups(
+                total_norm_sq, tracker.get("score_reduce_groups", [])
+            )
 
             tracker["last_score"] = total_norm_sq
 
@@ -2268,14 +2419,10 @@ class CDCOptimizer(MegatronOptimizer):
         lam0 = self.dc_lambda  # lambda base
         lam_max = float(args.cdc_dc_lambda_max)  # 上限
 
-        tp_group = mpu.get_tensor_model_parallel_group()
-        pp_group = mpu.get_pipeline_model_parallel_group()
+        score_reduce_groups = tracker.get("score_reduce_groups", [])
 
         def _reduce_shard_sum(x: float) -> float:
-            y = float(x)
-            y = self._all_reduce_scalar_sum(y, group=tp_group)
-            y = self._all_reduce_scalar_sum(y, group=pp_group)
-            return float(y)
+            return self._all_reduce_scalar_sum_across_groups(float(x), score_reduce_groups)
 
         # Helper: compute sum of squares in fp32 (device-agnostic)
         def _sqsum_fp32(t: torch.Tensor) -> float:
