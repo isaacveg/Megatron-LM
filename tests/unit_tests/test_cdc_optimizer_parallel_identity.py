@@ -80,6 +80,20 @@ class FakeLayer(torch.nn.Module):
         self.self_attention = torch.nn.Linear(2, 2, bias=False)
 
 
+class FakeLayerNumberChild(torch.nn.Module):
+    def __init__(self, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+        self.weight = torch.nn.Parameter(torch.ones(2, 2))
+
+
+class FakeLayerWithConflictingChild(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer_number = 8
+        self.self_attention = FakeLayerNumberChild(layer_number=1)
+
+
 class FakeChunk(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -375,6 +389,39 @@ def test_init_builds_global_identity_trackers_and_hooks(monkeypatch):
 
     for handle in optimizer._token_load_hook_handles:
         handle.remove()
+
+
+def test_diloco_all_skips_global_identity_build(monkeypatch):
+    CDCOptimizer = _load_cdc_optimizer_class()
+    args = _cdc_args(cdc_algorithm="diloco", cdc_moe_param_mode="all")
+    _patch_cdc_runtime(monkeypatch, CDCOptimizer, args)
+
+    def fail_if_called(self):
+        raise AssertionError("should not build identity")
+
+    monkeypatch.setattr(CDCOptimizer, "_build_global_identity_indices", fail_if_called)
+
+    model = FakeChunk()
+    optimizer = CDCOptimizer(FakeInnerOptimizer([model]), model_chunks=[model])
+
+    assert optimizer._layer_prefix_to_global_idx == {}
+    assert optimizer._local_moe_module_to_global_key == {}
+    assert optimizer._global_moe_module_index == {}
+    assert optimizer.original_snapshot
+
+
+def test_layer_identity_ignores_child_module_layer_number():
+    CDCOptimizer = _load_cdc_optimizer_class()
+    optimizer = CDCOptimizer.__new__(CDCOptimizer)
+    optimizer.model_chunks = [torch.nn.Module()]
+    optimizer.model_chunks[0].decoder = torch.nn.Module()
+    optimizer.model_chunks[0].decoder.layers = torch.nn.ModuleList(
+        [FakeLayerWithConflictingChild()]
+    )
+
+    layer_prefix_to_global_idx, _, _ = optimizer._build_global_identity_indices()
+
+    assert layer_prefix_to_global_idx == {"decoder.layers.0": 7}
 
 
 def test_init_rejects_cdc_parallel_size_one(monkeypatch):

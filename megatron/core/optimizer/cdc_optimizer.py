@@ -92,11 +92,16 @@ class CDCOptimizer(MegatronOptimizer):
         self.verbose = args.cdc_verbose
         self.mixed_precision = args.bf16 or args.fp16
         self._named_model_param_list = self._iter_named_trainable_params_unique(self.model_chunks)
-        (
-            self._layer_prefix_to_global_idx,
-            self._local_moe_module_to_global_key,
-            self._global_moe_module_index,
-        ) = self._build_global_identity_indices()
+        if self.algorithm in ['streaming', 'dc'] or self.moe_param_mode == 'dense-expert-hybrid':
+            (
+                self._layer_prefix_to_global_idx,
+                self._local_moe_module_to_global_key,
+                self._global_moe_module_index,
+            ) = self._build_global_identity_indices()
+        else:
+            self._layer_prefix_to_global_idx = {}
+            self._local_moe_module_to_global_key = {}
+            self._global_moe_module_index = {}
         self._expert_named_model_params = self._collect_routed_expert_named_params(
             self._named_model_param_list
         )
@@ -633,7 +638,7 @@ class CDCOptimizer(MegatronOptimizer):
             layer_number = getattr(module, "layer_number", None)
             if layer_number is not None:
                 prefix = self._layer_prefix_from_name(normalized_name)
-                if prefix is not None:
+                if prefix is not None and normalized_name == prefix:
                     global_idx = int(layer_number) - 1
                     previous = layer_to_global_idx.get(prefix)
                     if previous is not None and previous != global_idx:
