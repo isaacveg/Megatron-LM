@@ -1846,9 +1846,11 @@ class CDCOptimizer(MegatronOptimizer):
         """Select the next shard to sync based on staleness and gradient norm."""
         # Streaming: Simple Round-Robin
         if self.algorithm == 'streaming':
-            idx = self._next_nonempty_tracker_index(self.shard_tracker, self.next_shard_idx)
-            if idx is None:
-                return 0
+            # Keep the shard schedule global across TP/PP layouts. Pipeline stages may
+            # have empty local trackers for some global shards, but they must still
+            # advance through those slots so TP and PP runs apply the same shard at
+            # the same training step.
+            idx = self.next_shard_idx % self.num_shards
             self.next_shard_idx = (idx + 1) % self.num_shards
             return idx
 
@@ -2495,7 +2497,6 @@ class CDCOptimizer(MegatronOptimizer):
 
         # Empty tensor list is a valid no-op (e.g., shards that are empty on this PP stage).
         if not tensors:
-            print_rank_0("[CDC] Warning: _all_reduce_flattened called with empty tensor list. No operation performed.")
             return
 
         start_time = time.time()
